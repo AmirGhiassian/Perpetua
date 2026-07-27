@@ -24,12 +24,38 @@
   width: 0px;
 }
 
-/* Firefox scrollbar styling */
-.custom-scrollbar {
-  scrollbar-width: thin;
-  scrollbar-color: var(--app-primary) transparent;
-  transition: scrollbar-color 0.3s ease;
-  scrollbar-gutter: stable;
+.custom-scrollbar[data-scrollbar-mode="overlay"] {
+  scrollbar-width: none;
+}
+
+.custom-scrollbar[data-scrollbar-mode="overlay"]::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.custom-scrollbar-overlay {
+  position: fixed;
+  width: 8px;
+  z-index: 1000;
+  pointer-events: auto;
+  transition: opacity 0.08s ease;
+}
+
+.custom-scrollbar-overlay-thumb {
+  position: absolute;
+  top: 0;
+  left: 2px;
+  width: 4px;
+  min-height: 24px;
+  border-radius: 999px;
+  background-color: var(--app-primary);
+  box-shadow: none;
+  transition: background-color 0.16s ease;
+}
+
+.custom-scrollbar-overlay:hover .custom-scrollbar-overlay-thumb {
+  background-color: var(--app-primary-light);
+  box-shadow: none;
 }
 
 :root {
@@ -492,4 +518,3 @@
 .SelectScrollButton:hover {
   color: var(--app-text-primary);
 }
-

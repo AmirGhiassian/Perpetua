@@ -18,24 +18,21 @@
 
 import {useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState} from "react";
 import type {
+    Edge,
     MonitorInfo,
     MonitorPlacement,
 } from "../api/Interface";
 import {
     canvasToWorkspace,
     computeViewMetrics,
-    isAdjacentToAny,
     monitorAsRect,
-    placementAsRect,
-    rectsOverlap,
-    snapRect,
-    suggestInitialPlacement,
     validatePlacements,
     workspaceBounds,
     workspaceToCanvas,
 } from "../commons/layout";
+import type {Rect} from "../commons/layout";
 
-import { Monitor, GripVertical } from "lucide-react";
+import { AlertTriangle, GripVertical, Monitor, X } from "lucide-react";
 
 export interface LayoutEditorClient {
     uid: string;
@@ -73,12 +70,23 @@ interface DragState {
     placementIdx: number;
     grabDx: number;
     grabDy: number;
-    // Original position captured at pointerdown - used to revert if no valid landing is found.
+    // Original position captured at pointerdown; kept for future cancel/revert flows.
     originX: number;
     originY: number;
+    attachment: EdgeAttachment | null;
+    lastRect: Rect;
+    suppressAttachmentUntilTouch: boolean;
 }
 
-const SNAP_THRESHOLD_PX = 12;
+interface EdgeAttachment {
+    serverMonitorId: number;
+    edge: Edge;
+}
+
+const ATTACH_THRESHOLD_PX = 10;
+const DETACH_THRESHOLD_PX = 18;
+const TOUCH_THRESHOLD_PX = 1.5;
+const ATTACHED_SLIDE_FACTOR = 0.65;
 
 // Pointer-based drag from sidebar; HTML5 DnD drop events are unreliable in Tauri's WebView (macOS WKWebView).
 interface PendingPlacement {
@@ -105,6 +113,7 @@ export function LayoutEditor({
     const [canvasSize, setCanvasSize] = useState({width: 600, height});
     const [drag, setDrag] = useState<DragState | null>(null);
     const [pendingNew, setPendingNew] = useState<PendingPlacement | null>(null);
+    const [, setSelectedPlacementIdx] = useState<number | null>(null);
 
     useLayoutEffect(() => {
         if (!canvasRef.current) return;
@@ -139,9 +148,29 @@ export function LayoutEditor({
         [serverMonitors, placements],
     );
 
+    const validationSummary = useMemo(() => {
+        const overlapCount = validation.overlappingIndices.size;
+        const detachedCount = validation.notAdjacentToServerIndices.size;
+
+        if (overlapCount > 0 && detachedCount === 0) {
+            return `${overlapCount} overlap${overlapCount === 1 ? "" : "s"}`;
+        }
+        if (detachedCount > 0 && overlapCount === 0) {
+            return `${detachedCount} detached monitor${detachedCount === 1 ? "" : "s"}`;
+        }
+        const total = overlapCount + detachedCount;
+        return `${total} layout issue${total === 1 ? "" : "s"}`;
+    }, [validation.overlappingIndices, validation.notAdjacentToServerIndices]);
+
     useEffect(() => {
         onValidityChange?.(validation.ok, validation.errors);
     }, [validation.ok, validation.errors, onValidityChange]);
+
+    useEffect(() => {
+        setSelectedPlacementIdx((idx) =>
+            idx !== null && idx >= placements.length ? null : idx,
+        );
+    }, [placements.length]);
 
     const clientColors = useMemo(() => {
         const m: Record<string, string> = {};
@@ -174,10 +203,226 @@ export function LayoutEditor({
         return out;
     }, [clients, placements]);
 
+    const serverRectByMonitorId = useCallback((monitorId: number) => {
+        const monitor = serverMonitors.find((m) => m.monitor_id === monitorId);
+        return monitor ? monitorAsRect(monitor) : null;
+    }, [serverMonitors]);
+
+    const rangesOverlap = (aStart: number, aEnd: number, bStart: number, bEnd: number) =>
+        aStart < bEnd && bStart < aEnd;
+
+    const projectToAttachment = (candidate: Rect, serverRect: Rect, edge: Edge): Rect => {
+        switch (edge) {
+            case "left":
+                return {...candidate, x: serverRect.x - candidate.width};
+            case "right":
+                return {...candidate, x: serverRect.x + serverRect.width};
+            case "top":
+                return {...candidate, y: serverRect.y - candidate.height};
+            case "bottom":
+                return {...candidate, y: serverRect.y + serverRect.height};
+            default:
+                return candidate;
+        }
+    };
+
+    const outwardDistance = (candidate: Rect, serverRect: Rect, edge: Edge): number => {
+        const attached = projectToAttachment(candidate, serverRect, edge);
+        switch (edge) {
+            case "left":
+                return attached.x - candidate.x;
+            case "right":
+                return candidate.x - attached.x;
+            case "top":
+                return attached.y - candidate.y;
+            case "bottom":
+                return candidate.y - attached.y;
+            default:
+                return 0;
+        }
+    };
+
+    const findClosestServerAttachment = useCallback((
+        candidate: Rect,
+        threshold: number,
+    ): EdgeAttachment | null => {
+        let best: {attachment: EdgeAttachment; distance: number} | null = null;
+
+        for (const serverMonitor of serverMonitors) {
+            const serverRect = monitorAsRect(serverMonitor);
+            const candidateRight = candidate.x + candidate.width;
+            const candidateBottom = candidate.y + candidate.height;
+            const serverRight = serverRect.x + serverRect.width;
+            const serverBottom = serverRect.y + serverRect.height;
+
+            const candidates: Array<{
+                edge: Edge;
+                distance: number;
+                overlapsParallel: boolean;
+            }> = [
+                {
+                    edge: "left",
+                    distance: Math.abs(candidateRight - serverRect.x),
+                    overlapsParallel: rangesOverlap(candidate.y, candidateBottom, serverRect.y, serverBottom),
+                },
+                {
+                    edge: "right",
+                    distance: Math.abs(candidate.x - serverRight),
+                    overlapsParallel: rangesOverlap(candidate.y, candidateBottom, serverRect.y, serverBottom),
+                },
+                {
+                    edge: "top",
+                    distance: Math.abs(candidateBottom - serverRect.y),
+                    overlapsParallel: rangesOverlap(candidate.x, candidateRight, serverRect.x, serverRight),
+                },
+                {
+                    edge: "bottom",
+                    distance: Math.abs(candidate.y - serverBottom),
+                    overlapsParallel: rangesOverlap(candidate.x, candidateRight, serverRect.x, serverRight),
+                },
+            ];
+
+            for (const option of candidates) {
+                if (!option.overlapsParallel || option.distance > threshold) continue;
+                if (!best || option.distance < best.distance) {
+                    best = {
+                        attachment: {
+                            serverMonitorId: serverMonitor.monitor_id,
+                            edge: option.edge,
+                        },
+                        distance: option.distance,
+                    };
+                }
+            }
+        }
+
+        return best?.attachment ?? null;
+    }, [serverMonitors]);
+
+    const findCurrentAttachment = useCallback((rect: Rect): EdgeAttachment | null => {
+        return findClosestServerAttachment(rect, 2);
+    }, [findClosestServerAttachment]);
+
+    const rectsOverlapLocal = (a: Rect, b: Rect): boolean =>
+        !(
+            a.x + a.width <= b.x
+            || b.x + b.width <= a.x
+            || a.y + a.height <= b.y
+            || b.y + b.height <= a.y
+        );
+
+    const movementObstacles = useCallback((skipPlacementIdx?: number): Rect[] => [
+        ...serverMonitors.map(monitorAsRect),
+        ...placements
+            .filter((_, i) => i !== skipPlacementIdx)
+            .map((p) => ({
+                x: p.workspace_x,
+                y: p.workspace_y,
+                width: p.width,
+                height: p.height,
+            })),
+    ], [placements, serverMonitors]);
+
+    const moveAxisWithCollision = (
+        rect: Rect,
+        axis: "x" | "y",
+        target: number,
+        obstacles: Rect[],
+    ): Rect => {
+        const size = axis === "x" ? rect.width : rect.height;
+        const crossStart = axis === "x" ? rect.y : rect.x;
+        const crossEnd = crossStart + (axis === "x" ? rect.height : rect.width);
+        const current = axis === "x" ? rect.x : rect.y;
+        const delta = target - current;
+        if (delta === 0) return rect;
+
+        let resolved = target;
+        for (const obstacle of obstacles) {
+            const obstacleStart = axis === "x" ? obstacle.x : obstacle.y;
+            const obstacleEnd = obstacleStart + (axis === "x" ? obstacle.width : obstacle.height);
+            const obstacleCrossStart = axis === "x" ? obstacle.y : obstacle.x;
+            const obstacleCrossEnd = obstacleCrossStart + (axis === "x" ? obstacle.height : obstacle.width);
+            if (!rangesOverlap(crossStart, crossEnd, obstacleCrossStart, obstacleCrossEnd)) {
+                continue;
+            }
+
+            if (delta > 0) {
+                const currentEnd = current + size;
+                const targetEnd = target + size;
+                if (currentEnd <= obstacleStart && targetEnd > obstacleStart) {
+                    resolved = Math.min(resolved, obstacleStart - size);
+                }
+            } else if (current >= obstacleEnd && target < obstacleEnd) {
+                resolved = Math.max(resolved, obstacleEnd);
+            }
+        }
+
+        const next = {...rect, [axis]: resolved};
+        for (const obstacle of obstacles) {
+            if (!rectsOverlapLocal(next, obstacle)) continue;
+            if (delta > 0) {
+                return {...next, [axis]: (axis === "x" ? obstacle.x : obstacle.y) - size};
+            }
+            return {
+                ...next,
+                [axis]: (axis === "x" ? obstacle.x + obstacle.width : obstacle.y + obstacle.height),
+            };
+        }
+        return next;
+    };
+
+    const resolveCollision = useCallback((
+        candidate: Rect,
+        previous: Rect,
+        obstacles: Rect[],
+    ): Rect => {
+        const dx = candidate.x - previous.x;
+        const dy = candidate.y - previous.y;
+        const xFirst = Math.abs(dx) >= Math.abs(dy);
+        const axes: Array<"x" | "y"> = xFirst ? ["x", "y"] : ["y", "x"];
+        let resolved = previous;
+        for (const axis of axes) {
+            resolved = moveAxisWithCollision(
+                resolved,
+                axis,
+                axis === "x" ? candidate.x : candidate.y,
+                obstacles,
+            );
+        }
+        return resolved;
+    }, [placements, serverMonitors]);
+
+    const resolveInitialOverlap = useCallback((
+        candidate: Rect,
+        obstacles: Rect[],
+    ): Rect => {
+        let resolved = candidate;
+        for (const obstacle of obstacles) {
+            if (!rectsOverlapLocal(resolved, obstacle)) continue;
+            const pushLeft = Math.abs(resolved.x + resolved.width - obstacle.x);
+            const pushRight = Math.abs(obstacle.x + obstacle.width - resolved.x);
+            const pushUp = Math.abs(resolved.y + resolved.height - obstacle.y);
+            const pushDown = Math.abs(obstacle.y + obstacle.height - resolved.y);
+            const minPush = Math.min(pushLeft, pushRight, pushUp, pushDown);
+
+            if (minPush === pushLeft) {
+                resolved = {...resolved, x: obstacle.x - resolved.width};
+            } else if (minPush === pushRight) {
+                resolved = {...resolved, x: obstacle.x + obstacle.width};
+            } else if (minPush === pushUp) {
+                resolved = {...resolved, y: obstacle.y - resolved.height};
+            } else {
+                resolved = {...resolved, y: obstacle.y + obstacle.height};
+            }
+        }
+        return resolved;
+    }, []);
+
     function onPlacementPointerDown(e: React.PointerEvent, idx: number) {
         e.preventDefault();
         e.stopPropagation();
         if (!canvasRef.current) return;
+        setSelectedPlacementIdx(idx);
         const rect = canvasRef.current.getBoundingClientRect();
         const ws = canvasToWorkspace(
             e.clientX - rect.left,
@@ -185,17 +430,27 @@ export function LayoutEditor({
             metrics,
         );
         const p = placements[idx];
+        const initialRect = {
+            x: p.workspace_x,
+            y: p.workspace_y,
+            width: p.width,
+            height: p.height,
+        };
         setDrag({
             placementIdx: idx,
             grabDx: ws.x - p.workspace_x,
             grabDy: ws.y - p.workspace_y,
             originX: p.workspace_x,
             originY: p.workspace_y,
+            attachment: findCurrentAttachment(initialRect),
+            lastRect: initialRect,
+            suppressAttachmentUntilTouch: false,
         });
         (e.target as Element).setPointerCapture?.(e.pointerId);
     }
 
-    // Validation isn't enforced during the move (just visual feedback); see onDragEnd for snap-on-release.
+    // Attached monitors slide freely along the server edge; detaching requires
+    // a deliberate pull away from that edge.
     const onDragMove = useCallback((ev: PointerEvent) => {
         if (!drag || !canvasRef.current) return;
         const rect = canvasRef.current.getBoundingClientRect();
@@ -207,96 +462,125 @@ export function LayoutEditor({
         const target = placements[drag.placementIdx];
         if (!target) return;
 
+        const obstacles = movementObstacles(drag.placementIdx);
         const candidate = {
             x: ws.x - drag.grabDx,
             y: ws.y - drag.grabDy,
             width: target.width,
             height: target.height,
         };
+        let nextRect = candidate;
+        let nextAttachment = drag.attachment;
+        let suppressAttachmentUntilTouch = drag.suppressAttachmentUntilTouch;
+        const detachThreshold = DETACH_THRESHOLD_PX / metrics.scale;
 
-        const others = [
-            ...serverMonitors.map(monitorAsRect),
-            ...placements
-                .filter((_, i) => i !== drag.placementIdx)
-                .map(placementAsRect),
-        ];
-        const snapped = snapRect(candidate, others, SNAP_THRESHOLD_PX / metrics.scale);
+        if (drag.attachment) {
+            const serverRect = serverRectByMonitorId(drag.attachment.serverMonitorId);
+            if (!serverRect) {
+                nextAttachment = null;
+                suppressAttachmentUntilTouch = false;
+            } else if (
+                outwardDistance(candidate, serverRect, drag.attachment.edge)
+                > detachThreshold
+            ) {
+                nextAttachment = null;
+                suppressAttachmentUntilTouch = true;
+            } else {
+                nextRect = projectToAttachment(
+                    candidate,
+                    serverRect,
+                    drag.attachment.edge,
+                );
+                if (drag.attachment.edge === "left" || drag.attachment.edge === "right") {
+                    nextRect = {
+                        ...nextRect,
+                        y: drag.lastRect.y
+                            + (nextRect.y - drag.lastRect.y) * ATTACHED_SLIDE_FACTOR,
+                    };
+                } else {
+                    nextRect = {
+                        ...nextRect,
+                        x: drag.lastRect.x
+                            + (nextRect.x - drag.lastRect.x) * ATTACHED_SLIDE_FACTOR,
+                    };
+                }
+            }
+        }
+
+        if (!nextAttachment && !suppressAttachmentUntilTouch) {
+            const found = findClosestServerAttachment(
+                candidate,
+                ATTACH_THRESHOLD_PX / metrics.scale,
+            );
+            if (found) {
+                const serverRect = serverRectByMonitorId(found.serverMonitorId);
+                if (serverRect) {
+                    nextAttachment = found;
+                    suppressAttachmentUntilTouch = false;
+                    nextRect = projectToAttachment(candidate, serverRect, found.edge);
+                }
+            }
+        }
+
+        nextRect = resolveCollision(nextRect, drag.lastRect, obstacles);
+        if (!nextAttachment && suppressAttachmentUntilTouch) {
+            const touched = findClosestServerAttachment(
+                nextRect,
+                TOUCH_THRESHOLD_PX / metrics.scale,
+            );
+            if (touched) {
+                const serverRect = serverRectByMonitorId(touched.serverMonitorId);
+                if (serverRect) {
+                    nextAttachment = touched;
+                    suppressAttachmentUntilTouch = false;
+                    nextRect = projectToAttachment(nextRect, serverRect, touched.edge);
+                }
+            }
+        }
+
+        if (
+            nextAttachment?.serverMonitorId !== drag.attachment?.serverMonitorId
+            || nextAttachment?.edge !== drag.attachment?.edge
+            || suppressAttachmentUntilTouch !== drag.suppressAttachmentUntilTouch
+        ) {
+            setDrag((current) => {
+                if (!current || current.placementIdx !== drag.placementIdx) return current;
+                return {
+                    ...current,
+                    attachment: nextAttachment,
+                    lastRect: nextRect,
+                    suppressAttachmentUntilTouch,
+                };
+            });
+        } else {
+            setDrag((current) => {
+                if (!current || current.placementIdx !== drag.placementIdx) return current;
+                return {...current, lastRect: nextRect};
+            });
+        }
 
         const next = placements.slice();
         next[drag.placementIdx] = {
             ...target,
-            workspace_x: snapped.x,
-            workspace_y: snapped.y,
+            workspace_x: Math.round(nextRect.x),
+            workspace_y: Math.round(nextRect.y),
         };
         onChange(next);
-    }, [drag, metrics, placements, serverMonitors, onChange]);
+    }, [
+        drag,
+        findClosestServerAttachment,
+        metrics,
+        movementObstacles,
+        placements,
+        resolveCollision,
+        serverRectByMonitorId,
+        onChange,
+    ]);
 
-    // On release: if invalid, snap to the closest valid flush-to-edge slot around existing rects; else revert to origin.
+    // Release keeps the user-guided position. Validation remains visual and blocks Save.
     const onDragEnd = useCallback(() => {
-        setDrag((d) => {
-            if (!d) return null;
-            const target = placements[d.placementIdx];
-            if (!target) return null;
-
-            const others = [
-                ...serverMonitors.map(monitorAsRect),
-                ...placements
-                    .filter((_, i) => i !== d.placementIdx)
-                    .map(placementAsRect),
-            ];
-            const candidate = {
-                x: target.workspace_x,
-                y: target.workspace_y,
-                width: target.width,
-                height: target.height,
-            };
-
-            const isValid = (r: typeof candidate) =>
-                isAdjacentToAny(r, others)
-                && !others.some((o) => rectsOverlap(r, o));
-
-            if (!isValid(candidate)) {
-                let bestDist = Infinity;
-                let bestX = d.originX;
-                let bestY = d.originY;
-                const cx = candidate.x + candidate.width / 2;
-                const cy = candidate.y + candidate.height / 2;
-                for (const r of others) {
-                    const slots = [
-                        {x: r.x + r.width, y: r.y},
-                        {x: r.x - candidate.width, y: r.y},
-                        {x: r.x, y: r.y + r.height},
-                        {x: r.x, y: r.y - candidate.height},
-                    ];
-                    for (const s of slots) {
-                        const test = {
-                            x: s.x,
-                            y: s.y,
-                            width: candidate.width,
-                            height: candidate.height,
-                        };
-                        if (!isValid(test)) continue;
-                        const dx = s.x + candidate.width / 2 - cx;
-                        const dy = s.y + candidate.height / 2 - cy;
-                        const d2 = dx * dx + dy * dy;
-                        if (d2 < bestDist) {
-                            bestDist = d2;
-                            bestX = s.x;
-                            bestY = s.y;
-                        }
-                    }
-                }
-                const next = placements.slice();
-                next[d.placementIdx] = {
-                    ...target,
-                    workspace_x: bestX,
-                    workspace_y: bestY,
-                };
-                onChange(next);
-            }
-            return null;
-        });
-    }, [placements, serverMonitors, onChange]);
+        setDrag(null);
+    }, []);
 
     useEffect(() => {
         if (!drag) return;
@@ -355,81 +639,46 @@ export function LayoutEditor({
                 ev.clientY - rect.top,
                 metrics,
             );
-            const others = [
-                ...serverMonitors.map(monitorAsRect),
-                ...placements.map(placementAsRect),
-            ];
-
-            // Try the snapped cursor-centered candidate first, then fall back to the closest valid flush-to-edge slot.
-            const cursorCandidate = snapRect(
-                {
-                    x: ws.x - prev.width / 2,
-                    y: ws.y - prev.height / 2,
-                    width: prev.width,
-                    height: prev.height,
-                },
-                others,
-                SNAP_THRESHOLD_PX / metrics.scale,
-            );
             const cursorRect = {
-                ...cursorCandidate,
+                x: ws.x - prev.width / 2,
+                y: ws.y - prev.height / 2,
                 width: prev.width,
                 height: prev.height,
             };
-
-            let chosen: {x: number; y: number} | null = null;
-            if (
-                isAdjacentToAny(cursorRect, others)
-                && !others.some((r) => rectsOverlap(cursorRect, r))
-            ) {
-                chosen = {x: cursorCandidate.x, y: cursorCandidate.y};
-            } else {
-                let bestDist = Infinity;
-                for (const r of others) {
-                    const candidates = [
-                        {x: r.x + r.width, y: r.y},
-                        {x: r.x - prev.width, y: r.y},
-                        {x: r.x, y: r.y + r.height},
-                        {x: r.x, y: r.y - prev.height},
-                    ];
-                    for (const c of candidates) {
-                        const test = {
-                            x: c.x,
-                            y: c.y,
-                            width: prev.width,
-                            height: prev.height,
-                        };
-                        if (others.some((o) => rectsOverlap(test, o))) continue;
-                        const dx = c.x + prev.width / 2 - ws.x;
-                        const dy = c.y + prev.height / 2 - ws.y;
-                        const d2 = dx * dx + dy * dy;
-                        if (d2 < bestDist) {
-                            bestDist = d2;
-                            chosen = {x: c.x, y: c.y};
-                        }
-                    }
-                }
-                if (!chosen) {
-                    const fallback = suggestInitialPlacement(
-                        serverMonitors,
-                        placements,
-                    );
-                    chosen = {x: fallback.x, y: fallback.y};
+            let chosen = cursorRect;
+            const attachment = findClosestServerAttachment(
+                cursorRect,
+                ATTACH_THRESHOLD_PX / metrics.scale,
+            );
+            if (attachment) {
+                const serverRect = serverRectByMonitorId(attachment.serverMonitorId);
+                if (serverRect) {
+                    chosen = projectToAttachment(cursorRect, serverRect, attachment.edge);
                 }
             }
+            chosen = resolveInitialOverlap(chosen, movementObstacles());
 
             const newPlacement: MonitorPlacement = {
                 client_uid: prev.clientUid,
                 client_monitor_id: prev.clientMonitorId,
-                workspace_x: chosen.x,
-                workspace_y: chosen.y,
+                workspace_x: Math.round(chosen.x),
+                workspace_y: Math.round(chosen.y),
                 width: prev.width,
                 height: prev.height,
             };
             onChange([...placements, newPlacement]);
+            setSelectedPlacementIdx(placements.length);
             return null;
         });
-    }, [metrics, placements, serverMonitors, onChange]);
+    }, [
+        findClosestServerAttachment,
+        metrics,
+        movementObstacles,
+        placements,
+        resolveInitialOverlap,
+        serverRectByMonitorId,
+        onChange,
+    ]);
 
     const onPendingCancel = useCallback(() => setPendingNew(null), []);
 
@@ -448,6 +697,59 @@ export function LayoutEditor({
     function removePlacement(idx: number) {
         const next = placements.slice();
         next.splice(idx, 1);
+        onChange(next);
+        setSelectedPlacementIdx((selected) => {
+            if (selected === null) return null;
+            if (selected === idx) return null;
+            return selected > idx ? selected - 1 : selected;
+        });
+    }
+
+    function movePlacementByKeyboard(
+        e: React.KeyboardEvent<HTMLDivElement>,
+        idx: number,
+    ) {
+        const step = e.shiftKey ? 10 : 1;
+        const deltaByKey: Record<string, {dx: number; dy: number}> = {
+            ArrowLeft: {dx: -step, dy: 0},
+            ArrowRight: {dx: step, dy: 0},
+            ArrowUp: {dx: 0, dy: -step},
+            ArrowDown: {dx: 0, dy: step},
+        };
+
+        if (e.key === "Delete" || e.key === "Backspace") {
+            e.preventDefault();
+            removePlacement(idx);
+            return;
+        }
+
+        const delta = deltaByKey[e.key];
+        if (!delta) return;
+        e.preventDefault();
+        setSelectedPlacementIdx(idx);
+        const target = placements[idx];
+        if (!target) return;
+        const previousRect = {
+            x: target.workspace_x,
+            y: target.workspace_y,
+            width: target.width,
+            height: target.height,
+        };
+        const resolved = resolveCollision(
+            {
+                ...previousRect,
+                x: previousRect.x + delta.dx,
+                y: previousRect.y + delta.dy,
+            },
+            previousRect,
+            movementObstacles(idx),
+        );
+        const next = placements.slice();
+        next[idx] = {
+            ...target,
+            workspace_x: Math.round(resolved.x),
+            workspace_y: Math.round(resolved.y),
+        };
         onChange(next);
     }
 
@@ -502,11 +804,17 @@ export function LayoutEditor({
         const isDragging = drag?.placementIdx === idx;
         const badTitle = isOverlap
             ? `overlaps with another monitor - drag to a free area`
-            : `not adjacent to any server monitor - drag against a server edge`;
+            : `monitor detached - drag against a server edge`;
         return (
             <div
                 key={`p-${p.client_uid}-${p.client_monitor_id}-${idx}`}
+                className="focus:outline-none"
                 onPointerDown={(e) => onPlacementPointerDown(e, idx)}
+                onFocus={() => setSelectedPlacementIdx(idx)}
+                onKeyDown={(e) => movePlacementByKeyboard(e, idx)}
+                tabIndex={0}
+                role="button"
+                aria-label={`${client?.name || p.client_uid} monitor ${p.client_monitor_id}`}
                 style={{
                     position: "absolute",
                     left: tl.x,
@@ -526,6 +834,7 @@ export function LayoutEditor({
                     fontWeight: 600,
                     userSelect: "none",
                     cursor: isDragging ? "grabbing" : "grab",
+                    outline: "none",
                     boxShadow: isDragging
                         ? "0 4px 12px rgba(0,0,0,0.25)"
                         : "none",
@@ -562,32 +871,41 @@ export function LayoutEditor({
                             pointerEvents: "none",
                         }}
                     >
-                        !
+                        <AlertTriangle size={11} style={{margin: "2.5px auto"}} />
                     </div>
                 )}
                 <button
+                    type="button"
+                    aria-label={`Remove ${client?.name || p.client_uid} monitor ${p.client_monitor_id}`}
+                    onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                    }}
                     onClick={(e) => {
                         e.stopPropagation();
                         removePlacement(idx);
                     }}
                     title="Remove from workspace"
+                    className="transition-all duration-150 hover:scale-105 active:scale-95 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
                     style={{
                         position: "absolute",
-                        top: 3,
-                        right: 3,
-                        width: 16,
-                        height: 16,
+                        top: 4,
+                        right: 4,
+                        width: 22,
+                        height: 22,
                         borderRadius: "50%",
-                        border: "none",
-                        backgroundColor: "rgba(0,0,0,0.55)",
+                        border: "1px solid rgba(255,255,255,0.45)",
+                        backgroundColor: "rgba(0,0,0,0.62)",
                         color: "white",
-                        fontSize: 10,
-                        lineHeight: "16px",
                         padding: 0,
                         cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        outlineColor: "var(--app-primary-light)",
                     }}
                 >
-                    ×
+                    <X size={13} strokeWidth={2.5} />
                 </button>
             </div>
         );
@@ -678,11 +996,8 @@ export function LayoutEditor({
                             backgroundColor: "rgba(239, 68, 68, 0.92)",
                         }}
                     >
-                        <span className="text-xs leading-none">⚠</span>
-                        <span>
-                            {validation.errors.length} overlap
-                            {validation.errors.length === 1 ? "" : "s"}
-                        </span>
+                        <AlertTriangle size={13} />
+                        <span>{validationSummary}</span>
                     </div>
                 )}
             </div>
