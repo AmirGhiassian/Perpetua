@@ -24,8 +24,10 @@ import asyncio
 import atexit
 import ctypes
 import ctypes.util
+import os
 import sys
 import threading
+from time import monotonic, sleep
 from typing import Optional
 
 from Quartz import (
@@ -33,7 +35,11 @@ from Quartz import (
     CGCursorIsVisible,  # ty:ignore[unresolved-import]
     CGDisplayHideCursor,  # ty:ignore[unresolved-import]
     CGDisplayShowCursor,  # ty:ignore[unresolved-import]
+    CGEventCreate,  # ty:ignore[unresolved-import]
     CGEventCreateMouseEvent,  # ty:ignore[unresolved-import]
+    CGEventGetLocation,  # ty:ignore[unresolved-import]
+    CGSetLocalEventsSuppressionInterval,  # ty:ignore[unresolved-import]
+    CGWarpMouseCursorPosition,  # ty:ignore[unresolved-import]
     CGEventGetIntegerValueField,  # ty:ignore[unresolved-import]
     CGEventPost,  # ty:ignore[unresolved-import]
     CGEventSetIntegerValueField,  # ty:ignore[unresolved-import]
@@ -140,6 +146,32 @@ def _enable_cursor_hide_in_background() -> bool:
     return True
 
 
+def _disable_local_events_suppression() -> bool:
+    """Stop our own warps from freezing our own injected motion.
+
+    After ``CGWarpMouseCursorPosition`` macOS suppresses *local hardware* events
+    for ``CGSetLocalEventsSuppressionInterval`` seconds - 0.25 s by default -
+    so that a real mouse can't immediately fight an application's warp. Our
+    relative injection goes through the HID system, i.e. it *is* local hardware
+    input, so the interval suppresses us: measured 257 ms of a dead cursor after
+    a single warp, and a crossing warps the landing point repeatedly. That was
+    the "cursor frozen for a moment at the crossing point" report.
+
+    Zeroing the interval is the only remedy that works here (measured: 257 ms ->
+    ~0 ms). The two alternatives commonly cited both left it at 257 ms on Darwin
+    25.5: the per-source
+    ``CGEventSourceSetLocalEventsFilterDuringSuppressionState`` (it doesn't cover
+    warps, which have no event source) and re-associating right after the warp.
+    Deprecated but functional, like ``IOHIDPostEvent`` itself; it only affects
+    this process's connection, not other applications.
+    """
+    try:
+        CGSetLocalEventsSuppressionInterval(0.0)
+        return True
+    except Exception:
+        return False
+
+
 def _hide_cursor() -> None:
     CGDisplayHideCursor(CGMainDisplayID())
 
@@ -178,6 +210,301 @@ if sys.platform == "darwin":
     # If we crash while a client is active the user would otherwise be stuck
     # with a hidden, frozen cursor until reboot.
     atexit.register(_restore_cursor_state)
+
+
+# --------------------------------------------------------------------------- #
+# HID-level relative injection (IOKit / IOHIDSystem)
+#
+# A CGEvent always carries an absolute location, so posting one MOVES the cursor
+# even when the foreground app has called
+# CGAssociateMouseAndMouseCursorPosition(False) to lock it - the app's grab is
+# bypassed, the pointer drifts out of its window, and clicks land on whatever is
+# underneath (the desktop). Withholding the location instead pins the cursor for
+# everyone, which freezes it while the user types. There is no way to tell the
+# two situations apart: macOS exposes no getter for the association state (the
+# question is unanswered on Apple's own forums), and CGCursorIsVisible() reads
+# False both for a game's grab and for AppKit's type-in-a-text-field auto-hide.
+# Three generations of visibility-based heuristics here all ended up freezing
+# the cursor while typing.
+#
+# IOHIDPostEvent with kIOHIDSetRelativeCursorPosition delivers the delta to the
+# IOHIDSystem instead, which is *below* the association logic - the same path a
+# physical mouse takes. The OS then decides whether the cursor moves, so both
+# cases come out right with no detection at all: a grabbing app gets its deltas
+# while its cursor stays put, and while typing the pointer moves (and the OS
+# cancels its own auto-hide) exactly as a real mouse would.
+#
+# The API is deprecated (10.0-11.0) but alive and privilege-clean: it only
+# requires the caller's euid to own /dev/console, which holds for a daemon in the
+# user's session. Measured on Darwin 25.5: kIOReturnSuccess, 1.00 px per delta
+# unit, ~0.6 ms to show up in the cursor position versus ~17 ms for a CGEvent.
+# Same approach as ckb-next. If any of it fails we fall back to the CGEvent path.
+# --------------------------------------------------------------------------- #
+
+# IOKit/hidsystem/IOHIDShared.h
+_kIOHIDParamConnectType = 1
+# IOKit/IOLLEvent.h. The dragged variants matter: the HID system posts the event
+# type we ask for, it does NOT derive it from the button state, so motion while a
+# button is held must be posted as dragged or the drag breaks (measured: a plain
+# NX_MOUSEMOVED under a held button comes out as MouseMoved and drops the drag).
+_NX_MOUSEMOVED = 5
+_NX_LMOUSEDRAGGED = 6
+_NX_RMOUSEDRAGGED = 7
+_kNXEventDataVersion = 2
+# IOKit/hidsystem/IOHIDLib.h
+_kIOHIDSetRelativeCursorPosition = 0x00000004
+_kIOReturnSuccess = 0
+# NXEventData is a union whose exact size varies with the SDK; the callee reads
+# a fixed prefix, so an oversized zeroed buffer is always safe.
+_NXEVENTDATA_SIZE = 256
+
+
+class _IOGPoint(ctypes.Structure):
+    """IOKit's 16-bit screen point (IOKit/graphics/IOGraphicsTypes.h)."""
+
+    _fields_ = [("x", ctypes.c_int16), ("y", ctypes.c_int16)]
+
+
+class _NXMouseMove(ctypes.Structure):
+    """Head of NXEventData's ``mouseMove`` member (IOKit/IOLLEvent.h)."""
+
+    _fields_ = [
+        ("dx", ctypes.c_int32),
+        ("dy", ctypes.c_int32),
+        ("subx", ctypes.c_uint8),
+        ("suby", ctypes.c_uint8),
+    ]
+
+
+class _HIDRelativeInjector:
+    """Lazy, self-disabling wrapper over an IOHIDSystem param connection.
+
+    ``available`` flips to False the first time anything fails, so the hot path
+    never retries a broken connection (and never logs per event) - the caller
+    falls back to CGEvents from then on. Every disable records a reason, which
+    the caller drains exactly once through ``take_failure``.
+
+    ``IOHIDPostEvent`` is deprecated, so this deliberately does not trust its
+    return code alone: ``verify`` checks that the cursor really moved, which is
+    what would catch the API being turned into a silent no-op. Without that the
+    failure would be invisible - a motionless cursor reads exactly like an app
+    holding the pointer, and the CGEvent fallback would never engage.
+    """
+
+    def __init__(self, forced_off: Optional[str] = None):
+        self._forced_off = forced_off
+        self._reset()
+
+    def _reset(self) -> None:
+        self._iokit = None
+        self._service = 0
+        self._connect = 0
+        self._opened = False
+        self.available = sys.platform == "darwin" and self._forced_off is None
+        self.failure: Optional[str] = self._forced_off
+
+    # How long the self-test waits for the injected pixel to show up in the
+    # cursor position. Generous on purpose: the read lags the injection by a few
+    # milliseconds, and failing a healthy path would silently cost the game
+    # fidelity the HID route exists for.
+    SELF_TEST_TIMEOUT = 0.05
+
+    def take_failure(self) -> Optional[str]:
+        """Return the pending failure reason, once."""
+        failure, self.failure = self.failure, None
+        return failure
+
+    def _disable(self, reason: str) -> bool:
+        """Record why the HID path is out and hand over to the fallback."""
+        self.available = False
+        self.failure = reason
+        return False
+
+    def _open(self) -> bool:
+        self._opened = True
+        try:
+            iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+            iokit.IOServiceMatching.restype = ctypes.c_void_p
+            iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+            iokit.IOServiceGetMatchingService.restype = ctypes.c_uint32
+            iokit.IOServiceGetMatchingService.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            ]
+            iokit.IOServiceOpen.restype = ctypes.c_int32
+            iokit.IOServiceOpen.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            iokit.IOServiceClose.restype = ctypes.c_int32
+            iokit.IOServiceClose.argtypes = [ctypes.c_uint32]
+            iokit.IOObjectRelease.restype = ctypes.c_int32
+            iokit.IOObjectRelease.argtypes = [ctypes.c_uint32]
+            iokit.IOHIDPostEvent.restype = ctypes.c_int32
+            iokit.IOHIDPostEvent.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                _IOGPoint,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+            ]
+
+            matching = iokit.IOServiceMatching(b"IOHIDSystem")
+            if not matching:
+                return self._disable("IOServiceMatching(IOHIDSystem) returned NULL")
+            # IOServiceGetMatchingService consumes the matching dictionary.
+            service = iokit.IOServiceGetMatchingService(0, matching)
+            if not service:
+                return self._disable("IOHIDSystem service not found")
+
+            # mach_task_self() is a macro over the mach_task_self_ global.
+            libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            task = ctypes.c_uint32.in_dll(libsystem, "mach_task_self_").value
+
+            connect = ctypes.c_uint32(0)
+            rc = iokit.IOServiceOpen(
+                service, task, _kIOHIDParamConnectType, ctypes.byref(connect)
+            )
+            if rc != _kIOReturnSuccess or not connect.value:
+                iokit.IOObjectRelease(service)
+                return self._disable(f"IOServiceOpen returned 0x{rc & 0xFFFFFFFF:08X}")
+
+            self._iokit = iokit
+            self._service = service
+            self._connect = connect.value
+            return True
+        except Exception as e:
+            return self._disable(f"IOServiceOpen failed - {type(e).__name__}: {e}")
+
+    def post(self, dx: int, dy: int, event_type: int = _NX_MOUSEMOVED) -> bool:
+        """Post one relative motion event. False means "use the fallback".
+
+        ``event_type`` must be a dragged variant while a button is held.
+        """
+        if not self.available:
+            return False
+        if not self._opened and not self._open():
+            return False
+        if self._iokit is None:
+            # Reachable only if the connection was closed under us; without a
+            # reason here the degradation would be silent.
+            return self._disable("IOKit connection is not open")
+        try:
+            buf = (ctypes.c_uint8 * _NXEVENTDATA_SIZE)()
+            move = ctypes.cast(buf, ctypes.POINTER(_NXMouseMove)).contents
+            move.dx = int(dx)
+            move.dy = int(dy)
+            rc = self._iokit.IOHIDPostEvent(
+                self._connect,
+                event_type,
+                _IOGPoint(0, 0),
+                ctypes.byref(buf),
+                _kNXEventDataVersion,
+                0,
+                _kIOHIDSetRelativeCursorPosition,
+            )
+        except Exception as e:
+            return self._disable(f"IOHIDPostEvent failed - {type(e).__name__}: {e}")
+        if rc != _kIOReturnSuccess:
+            return self._disable(f"IOHIDPostEvent returned 0x{rc & 0xFFFFFFFF:08X}")
+        return True
+
+    def verify(self, read_position) -> bool:
+        """Check that a posted delta actually moves the cursor.
+
+        ``IOHIDPostEvent`` is deprecated: the failure mode to fear is not an
+        error code but a silent no-op, and that one is invisible from here - a
+        cursor that never moves is indistinguishable from an app holding the
+        pointer, so the fallback would never engage and the cursor would simply
+        stay dead. One pixel out and back settles it. A failure here is not
+        fatal: it just means the CGEvent path takes over.
+
+        ``read_position`` is injected rather than imported so this stays a
+        property of the caller's coordinate source.
+        """
+        if not self.available:
+            return False
+        before = read_position()
+        if before is None:
+            return self._disable("cannot read the cursor position to self-test")
+        if not self.post(1, 0):
+            return False
+
+        # The position takes a few milliseconds to reflect an injected delta
+        # (measured: unchanged at 2 ms, changed by 10 ms), so a single immediate
+        # read would fail a perfectly good path. Poll instead, and leave as soon
+        # as it moves - the healthy case costs a few milliseconds, the broken
+        # one the whole window, and only at init or on activation.
+        deadline = monotonic() + self.SELF_TEST_TIMEOUT
+        moved = False
+        while not moved and monotonic() < deadline:
+            after = read_position()
+            if after is None:
+                self.post(-1, 0)
+                return self._disable("cannot read the cursor position to self-test")
+            moved = after != before
+            if not moved:
+                sleep(0.002)
+
+        # Put it back before judging: the probe must not leave the cursor moved
+        # even when it worked.
+        self.post(-1, 0)
+        if not moved:
+            return self._disable("IOHIDPostEvent succeeded but the cursor did not move")
+        return True
+
+    def retry(self, read_position) -> bool:
+        """Re-attempt a disabled HID path. Never called from the hot path.
+
+        A failure at daemon start (login window, fast user switching) must not
+        pin the whole session to the fallback, so activation re-arms it once.
+        """
+        if self.available:
+            return True
+        if self._forced_off is not None:
+            return False
+        self.close()
+        self._reset()
+        return self.verify(read_position)
+
+    def close(self) -> None:
+        try:
+            if self._iokit is not None:
+                if self._connect:
+                    self._iokit.IOServiceClose(self._connect)
+                if self._service:
+                    self._iokit.IOObjectRelease(self._service)
+        except Exception:
+            pass
+        finally:
+            self._connect = 0
+            self._service = 0
+            self._iokit = None
+            # Posting on a closed connection would target io_connect_t 0.
+            self.available = False
+
+
+# Escape hatch: run the client on the CGEvent path as if IOKit were gone. It is
+# what makes the fallback verifiable end-to-end instead of a code path nobody
+# has ever exercised - and IOHIDPostEvent being deprecated makes that path a
+# question of when, not if.
+FORCE_CGEVENT_ENV_VAR = "PERPETUA_MOUSE_FORCE_CGEVENT"
+
+
+def _forced_cgevent_reason() -> Optional[str]:
+    if os.environ.get(FORCE_CGEVENT_ENV_VAR) == "1":
+        return f"forced by {FORCE_CGEVENT_ENV_VAR}=1"
+    return None
+
+
+_hid_injector = _HIDRelativeInjector(_forced_cgevent_reason())
+
+if sys.platform == "darwin":
+    atexit.register(_hid_injector.close)
 
 
 # Mouse-move events that carry HID deltas we forward to the active client.
@@ -556,39 +883,155 @@ class ClientMouseController(_base.ClientMouseController):
     Its main purpose is to move the cursor and simulate mouse clicks.
     """
 
-    def _cursor_is_hidden(self) -> bool:
-        """True when the system cursor is hidden (game pointer lock).
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Must happen before the first warp AND before the self-test below: see
+        # the function's docstring for why our own warps would otherwise freeze
+        # our own injected motion (and would make the self-test read a cursor
+        # that legitimately did not move).
+        ok = _disable_local_events_suppression()
+        self._logger.info("local events suppression disabled", ok=ok)
+        _hid_injector.verify(self._cursor_position)
+        self._log_injection_mode()
 
-        Read-only: a foreground game hides the cursor when it grabs the
-        pointer. We never hide/show it ourselves.
-        """
-        return not CGCursorIsVisible()
+    def _log_injection_mode(self) -> None:
+        """State the active injection path, and why, whenever it changes."""
+        failure = _hid_injector.take_failure()
+        if _hid_injector.available:
+            self._logger.info("mouse injection path", mode="hid")
+        else:
+            self._logger.warning(
+                "mouse injection degraded to CGEvent",
+                mode="cgevent",
+                reason=failure or "unknown",
+            )
 
-    def _inject_relative(self, dx: int, dy: int) -> None:
-        """Post a genuine relative-motion CGEvent so games read the delta.
+    def _on_relative_injection_degraded(self) -> None:
+        """Retry the HID path once per activation, never on the hot path."""
+        was_available = _hid_injector.available
+        _hid_injector.retry(self._cursor_position)
+        if _hid_injector.available != was_available or _hid_injector.failure:
+            self._log_injection_mode()
 
-        pynput's ``Controller.move`` warps the cursor to an absolute
-        position; first-person games reading ``kCGMouseEventDeltaX/Y`` see
-        nothing that way. Normally we move the system cursor to
-        ``current + delta`` (so the visible pointer tracks on the desktop)
-        *and* stamp the event's delta fields, which is what the game's camera
-        consumes. Under a game pointer lock (``_pointer_locked``) the game
-        pins/centers the cursor itself, so we keep the event at the *current*
-        position — only the delta fields carry movement — otherwise our
-        absolute point would drag the pinned cursor around. During a drag the
-        motion must be delivered as a ``…MouseDragged`` event, not
-        ``MouseMoved``, or the drag breaks.
+    def _cursor_position(self) -> Optional[tuple[float, float]]:
+        """Cursor position according to the *event system*.
+
+        pynput reads ``NSEvent.mouseLocation()`` (an AppKit-level value, defined
+        in terms of the last event, and flipped against the main display's
+        height). Injection here happens at the HID/event-system level, so the
+        read is taken from the same place - ``CGEventGetLocation`` on a fresh
+        event, which is what Deskflow uses for exactly this reason.
         """
         try:
-            cur_x, cur_y = self._controller.position
-            if self._pointer_locked:
-                new_x, new_y = cur_x, cur_y
-            else:
-                new_x = cur_x + dx
-                new_y = cur_y + dy
+            loc = CGEventGetLocation(CGEventCreate(None))
+            return float(loc.x), float(loc.y)
+        except Exception as e:
+            self._logger.error("failed to read cursor position", error=str(e))
+            return None
 
-            if self._pressed and self._is_dragging:
-                if self._previous_button == ButtonMapping.right.value:
+    def _warp_cursor(self, x: float | int, y: float | int) -> None:
+        """Place the cursor without generating a mouse event.
+
+        ``CGWarpMouseCursorPosition`` is the documented way to move the pointer
+        for its own sake: unlike posting a ``MouseMoved`` CGEvent (what pynput's
+        position setter does) it emits nothing, so a landing no longer injects a
+        burst of synthetic movement into whatever app is focused - a game would
+        read those as camera input. It also still works while an app has
+        dissociated the cursor.
+
+        The measurement state is dropped for the same reason as in the base
+        class: a warp is not travel, and whether the OS was withholding our
+        motion before it is no longer known.
+        """
+        self._last_seen_pos = None
+        self._immobile_moves = 0
+        CGWarpMouseCursorPosition((float(x), float(y)))
+
+    def _inject_relative(self, dx: int, dy: int) -> tuple[int, int]:
+        """Deliver relative motion the way a physical mouse does.
+
+        The delta goes to the ``IOHIDSystem`` via ``IOHIDPostEvent``, which sits
+        *below* ``CGAssociateMouseAndMouseCursorPosition``, so the OS - not us -
+        decides whether the visible cursor moves. That single property is what
+        makes both problem cases come out right without detecting anything:
+
+        - an app that grabbed the pointer receives the deltas while its cursor
+          stays exactly where it put it (measured: 0 px of movement during a
+          burst, versus 400 px through a CGEvent, which bypasses the grab and is
+          how the pointer used to drift out of a game's window);
+        - while the user types, the pointer moves and macOS cancels its own
+          "hidden until the mouse moves" auto-hide, as with any real mouse. No
+          pinning, so nothing can freeze.
+
+        A held button changes only the event *type*, never the path: the HID
+        system posts what we ask for rather than deriving it from the button
+        state, so motion while dragging goes out as ``NX_?MOUSEDRAGGED`` and the
+        drag survives (verified with an event tap: the OS delivers
+        ``LeftMouseDragged``, and it works even though the press itself came
+        through a CGEvent). Falling back to a CGEvent for drags instead - which
+        is what this did at first - reintroduced the absolute position, so
+        holding a button in a game made the grabbed cursor drift again.
+
+        The return value is the displacement the cursor *actually took*, which
+        the OS decides here: it is measured from the position observed at the
+        previous injection, so a grabbed (immobile) cursor correctly reports no
+        travel to ``_accumulate_inward_travel``.
+        """
+        pos = self._cursor_position()
+        applied = (0, 0)
+        if pos is not None:
+            if self._last_seen_pos is not None:
+                applied = (
+                    round(pos[0] - self._last_seen_pos[0]),
+                    round(pos[1] - self._last_seen_pos[1]),
+                )
+                # Count how long the OS has been withholding our motion, so
+                # edge routing can stand down while an app holds the pointer
+                # (``IMMOBILE_MOVES_BEFORE_HOLD``). Only a *requested* move
+                # that produced nothing counts; without a baseline we don't
+                # know, so we don't guess. And a cursor already against a
+                # bound does not move when pushed further that way - that
+                # immobility is geometric, not a grab, and counting it would
+                # suspend edge routing exactly while the user is pushing at
+                # the edge to hand control back to the server.
+                if (
+                    applied == (0, 0)
+                    and (dx or dy)
+                    and not self._motion_is_bounded(pos[0], pos[1], dx, dy)
+                ):
+                    self._immobile_moves += 1
+                else:
+                    self._immobile_moves = 0
+            self._last_seen_pos = pos
+
+        dragging = self._pressed and self._is_dragging
+        right_drag = dragging and self._previous_button == ButtonMapping.right.value
+        if dragging:
+            hid_type = _NX_RMOUSEDRAGGED if right_drag else _NX_LMOUSEDRAGGED
+        else:
+            hid_type = _NX_MOUSEMOVED
+
+        if _hid_injector.post(dx, dy, hid_type):
+            return applied
+        if _hid_injector.failure is not None:
+            # Drains the reason, so this reports once per degradation rather
+            # than once per event.
+            self._log_injection_mode()
+
+        try:
+            if pos is None:
+                return super()._inject_relative(dx, dy)
+            # Clamp to the desktop. A CGEvent carries an absolute location, and
+            # the position we read back is the one we posted, not the one the
+            # cursor ended up at: pushing past a screen edge would compound
+            # ``pos + delta`` every event. The HID path needs
+            # none of this - there the OS owns the position and it stays put.
+            min_x, min_y, max_x, max_y = self._screen_bbox
+            new_x = max(min_x, min(max_x - 1, pos[0] + dx))
+            new_y = max(min_y, min(max_y - 1, pos[1] + dy))
+
+            if dragging:
+                if right_drag:
                     event_type = kCGEventRightMouseDragged
                     button = kCGMouseButtonRight
                 else:
@@ -602,6 +1045,7 @@ class ClientMouseController(_base.ClientMouseController):
             CGEventSetIntegerValueField(event, kCGMouseEventDeltaX, int(dx))
             CGEventSetIntegerValueField(event, kCGMouseEventDeltaY, int(dy))
             CGEventPost(kCGHIDEventTap, event)
+            return applied
         except Exception as e:
             self._logger.error("relative CGEvent injection failed", error=str(e))
-            super()._inject_relative(dx, dy)
+            return super()._inject_relative(dx, dy)

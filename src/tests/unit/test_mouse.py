@@ -22,6 +22,8 @@ Tests EdgeDetector, ServerMouseListener, ServerMouseController, and ClientMouseC
 from tests.unit import _MOCK_PYNPUT
 
 import asyncio
+import sys
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -871,6 +873,74 @@ class TestClientMouseController:
                 event_bus, mock_stream_handler, mock_stream_handler
             )
 
+    def test_inward_travel_tracks_applied_displacement(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """``_inward_travel`` follows the cursor, not the delta we were sent.
+
+        A backend reports what the OS really applied: on macOS the deltas go
+        through the HID system, so an app holding the pointer keeps the cursor
+        still and no travel happens. Crediting the raw delta instead would
+        saturate the offset and latch ``_return_armed`` against a cursor that
+        never left the edge.
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        c._active_target_bbox = (0, 0, 1920, 1080)
+        c._return_locked_edge = ScreenEdge.LEFT
+
+        with patch.object(c, "_inject_relative", return_value=(0, 0)):
+            for _ in range(200):
+                c._move_cursor(-1, -1, 40, 0)
+        assert c._inward_travel == 0
+        assert c._return_armed is False
+        # The raw delta is still cached — it is a direction hint for
+        # ``_detect_edge_via_delta``, not a displacement.
+        assert c._last_move_delta == (40, 0)
+
+        with patch.object(c, "_inject_relative", return_value=(40, 0)):
+            for _ in range(3):
+                c._move_cursor(-1, -1, 40, 0)
+        assert c._inward_travel == 120
+        assert c._return_armed is True
+        assert c._last_move_delta == (40, 0)
+
+    @pytest.mark.anyio
+    async def test_return_to_server_survives_an_immobile_burst(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """After a burst that moved nothing, the entry edge must still return.
+
+        A pointer held by a foreground app used to saturate ``_inward_travel``
+        from the raw deltas, closing the return gate for good, so every later
+        tick fell through to ``_clamp_cursor_to_monitor`` — dead movement.
+        """
+        with _ScreenGeometry(1920, 1080):
+            c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+            self._activate_left_entry(c)
+
+            # The app holds the pointer: deltas arrive, nothing moves.
+            with patch.object(c, "_inject_relative", return_value=(0, 0)):
+                for _ in range(200):
+                    c._move_cursor(-1, -1, 40, 0)
+            assert c._inward_travel == 0
+            assert c._return_armed is False
+
+            # Pointer released: real movement resumes - enter, then sweep back.
+            for _ in range(10):
+                c._move_cursor(-1, -1, 40, 0)
+            assert c._return_armed is True
+            for _ in range(10):
+                c._move_cursor(-1, -1, -40, 0)
+            assert c._inward_travel <= c.RETURN_RELEASE_MARGIN
+
+            c._controller.position = (0, 500)
+            c._last_move_delta = (-3, 0)
+            with patch.object(c, "_clamp_cursor_to_monitor") as clamp:
+                await c._check_edge()
+
+            assert mock_stream_handler.send.called, "return-to-server never fired"
+            clamp.assert_not_called()
+
     def test_accumulate_inward_travel_arms_after_margin(
         self, event_bus, mock_stream_handler, mock_mouse_controller
     ):
@@ -1105,6 +1175,125 @@ class TestClientMouseController:
             c._last_move_delta = (-3, 0)
             await c._check_edge()
             assert mock_stream_handler.send.called  # return-to-server fired
+
+    @pytest.mark.parametrize(
+        "position",
+        [(0, 500), (1919, 500), (500, 0), (500, 1079), (0, 0), (1919, 1079)],
+    )
+    def test_clamp_leaves_a_cursor_on_the_boundary_alone(
+        self, event_bus, mock_stream_handler, mock_mouse_controller, position
+    ):
+        """The boundary pixel is inside the monitor, so nothing to correct.
+
+        The OS already holds the cursor there while the user pushes outward;
+        nudging it inward every tick is what made the cursor bounce off the
+        edge. All four sides, and the corners.
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        monitor = MonitorLayout.from_bboxes([(0, 0, 1920, 1080)]).monitors[0]
+
+        with (
+            patch.object(c, "_cursor_position", return_value=position),
+            patch.object(c, "_warp_cursor") as warp,
+        ):
+            c._clamp_cursor_to_monitor(monitor)
+
+        warp.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "position, expected",
+        [
+            ((-40, 500), (0, 500)),
+            ((2000, 500), (1919, 500)),
+            ((500, -40), (500, 0)),
+            ((500, 1200), (500, 1079)),
+            ((-40, 1200), (0, 1079)),
+        ],
+    )
+    def test_clamp_pulls_back_a_cursor_that_really_left(
+        self, event_bus, mock_stream_handler, mock_mouse_controller, position, expected
+    ):
+        """Drift onto another monitor (or a dead zone) still gets corrected.
+
+        Landing exactly on the nearest valid pixel, not pushed further in: the
+        two sides used to be asymmetric (min+1 against max-2).
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        monitor = MonitorLayout.from_bboxes([(0, 0, 1920, 1080)]).monitors[0]
+
+        with (
+            patch.object(c, "_cursor_position", return_value=position),
+            patch.object(c, "_warp_cursor") as warp,
+        ):
+            c._clamp_cursor_to_monitor(monitor)
+
+        warp.assert_called_once_with(*expected)
+
+    @pytest.mark.anyio
+    async def test_pushing_at_a_void_edge_never_moves_the_cursor(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """The reported bug, end to end: no warp at all while pushing outward.
+
+        The user pushes, the OS pins the cursor at the bound, and every tick we
+        used to warp it a pixel inward - at 125 Hz that is the visible bounce.
+        """
+        with _ScreenGeometry(1920, 1080):
+            c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+            c._is_active = True
+            c._edge_bindings = []
+            c._intra_client_bindings = []
+            c._intra_by_src = {}
+            c._intra_pairs = set()
+            # Where the OS holds it while the user keeps pushing left.
+            mock_mouse_controller.position = (0, 500)
+
+            with patch.object(c, "_warp_cursor") as warp:
+                for _ in range(30):
+                    c._last_move_delta = (-8, 0)
+                    await c._check_edge()
+
+            warp.assert_not_called()
+            mock_stream_handler.send.assert_not_called()
+
+    def test_motion_bounds_follow_the_monitor_under_the_cursor(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """Where the cursor can go is the monitor's box, not the desktop union.
+
+        With a taller monitor alongside, the union extends well below the short
+        one: judging against the union would call a cursor stuck at the bottom
+        of the small screen "free to move", and a backend that measures
+        displacement would then read the OS swallowing the delta as an app
+        holding the pointer.
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        c._monitor_layout = MonitorLayout.from_bboxes(
+            [(0, 0, 1920, 1080), (1920, 0, 3840, 2160)]
+        )
+        c._cached_monitor = None
+        c._screen_bbox = (0, 0, 3840, 2160)
+
+        assert c._motion_bounds(500, 1000) == (0, 0, 1920, 1080)
+        # Bottom of the SHORT monitor, pushing down: the OS will swallow it.
+        assert c._motion_is_bounded(500, 1079, 0, 5) is True
+        # Same y on the tall monitor: there is room, so immobility would be real.
+        c._cached_monitor = None
+        assert c._motion_is_bounded(2500, 1079, 0, 5) is False
+
+    def test_motion_bounds_fall_back_to_the_desktop(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """Off every monitor (L-shaped dead zone), the desktop union is the box."""
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        c._screen_bbox = (0, 0, 1920, 1080)
+
+        with patch.object(c, "_find_monitor_for_cursor", return_value=None):
+            assert c._motion_bounds(10, 10) == (0, 0, 1920, 1080)
+            assert c._motion_is_bounded(0, 500, -5, 0) is True
+            assert c._motion_is_bounded(50, 500, -5, 0) is False
+            # A zero delta on an axis asks for nothing, so it cannot be unmet.
+            assert c._motion_is_bounded(0, 500, 0, 0) is True
 
     def test_intra_warp_rearms_return_lock(
         self, event_bus, mock_stream_handler, mock_mouse_controller
@@ -1575,7 +1764,12 @@ class TestClientMouseController:
         mock_stream_handler,
         mock_mouse_controller,
     ):
-        """Edge with no workspace binding clamps the cursor inside the monitor."""
+        """An edge with no binding keeps control here - without touching the cursor.
+
+        The cursor is sitting on the boundary pixel, which is where the OS holds
+        it while the user pushes outward. Nudging it inward to restate that is
+        what made the cursor visibly bounce off the edge.
+        """
         with patch(
             "input.mouse._base.MouseController", return_value=mock_mouse_controller
         ):
@@ -1596,10 +1790,11 @@ class TestClientMouseController:
                     controller._movement_history.append((x, 500))
                 mock_mouse_controller.position = (0, 500)
 
-                await controller._check_edge()
+                with patch.object(controller, "_warp_cursor") as warp:
+                    await controller._check_edge()
 
-                cx, cy = mock_mouse_controller.position
-                assert cx > 0
+                warp.assert_not_called()
+                assert mock_mouse_controller.position == (0, 500)
                 mock_stream_handler.send.assert_not_called()
 
     @pytest.mark.anyio
@@ -1947,3 +2142,721 @@ class TestMonitorHotplug:
 
         mock_stream_handler.send.assert_not_called()
         assert controller._is_active is True
+
+
+# ============================================================================
+# macOS ClientMouseController backend Tests
+# ============================================================================
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="Quartz-backed macOS mouse backend"
+)
+class TestDarwinClientMouseController:
+    """Regression cover for the macOS relative-injection backend."""
+
+    def _make_client(self, event_bus, mock_stream_handler, mock_mouse_controller):
+        from input.mouse import _darwin
+
+        # The controller self-tests the HID path on init (see
+        # ``_HIDRelativeInjector.verify``); that must not post real events - nor
+        # disable the module-wide injector - during a test run.
+        with (
+            patch(
+                "input.mouse._base.MouseController", return_value=mock_mouse_controller
+            ),
+            patch("input.mouse._darwin._hid_injector", MagicMock()),
+        ):
+            return _darwin.ClientMouseController(
+                event_bus, mock_stream_handler, mock_stream_handler
+            )
+
+    # --- relative injection ------------------------------------------------
+    #
+    # The deltas go through IOHIDPostEvent, below
+    # CGAssociateMouseAndMouseCursorPosition, so the OS decides whether the
+    # cursor moves. That is what lets a game hold its pointer while typing stays
+    # untouched, with no cursor-visibility guessing anywhere (three earlier
+    # generations of that heuristic all froze the cursor while typing).
+
+    def _patch_hid(self, *, ok: bool, failure=None):
+        """Stand in for the module-level HID injector.
+
+        Mirrors the real contract: ``available`` tracks the path, and
+        ``take_failure`` drains the reason once so the caller reports a
+        degradation per degradation, not per event.
+        """
+        injector = MagicMock()
+        injector.post.return_value = ok
+        injector.available = ok
+        injector.failure = failure
+
+        def take_failure():
+            reason, injector.failure = injector.failure, None
+            return reason
+
+        injector.take_failure.side_effect = take_failure
+        return patch("input.mouse._darwin._hid_injector", injector), injector
+
+    def test_relative_motion_goes_through_the_hid_system(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """The HID path is preferred, and no CGEvent is posted when it works."""
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        ctx, injector = self._patch_hid(ok=True)
+
+        with (
+            ctx,
+            patch("input.mouse._darwin.CGEventCreateMouseEvent") as create,
+            patch.object(c, "_cursor_position", return_value=(400.0, 300.0)),
+        ):
+            c._inject_relative(7, -5)
+
+        from input.mouse import _darwin
+
+        injector.post.assert_called_once_with(7, -5, _darwin._NX_MOUSEMOVED)
+        create.assert_not_called()
+
+    def test_hid_failure_falls_back_to_cgevent_and_warns_once(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """An unavailable HID path degrades to CGEvents without per-event noise."""
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        ctx, injector = self._patch_hid(ok=False, failure="IOServiceOpen returned 0x…")
+
+        with (
+            ctx,
+            patch("input.mouse._darwin.CGEventCreateMouseEvent") as create,
+            patch("input.mouse._darwin.CGEventSetIntegerValueField"),
+            patch("input.mouse._darwin.CGEventPost"),
+            patch.object(c, "_cursor_position", return_value=(400.0, 300.0)),
+            patch.object(c._logger, "warning") as warn,
+        ):
+            c._inject_relative(7, -5)
+            c._inject_relative(7, -5)
+
+        assert create.call_count == 2, "both moves must still be delivered"
+        # current position + delta, since the OS is not applying it for us here
+        assert create.call_args.args[2] == (407.0, 295.0)
+        warn.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "button, expected_type",
+        [
+            (ButtonMapping.left.value, "_NX_LMOUSEDRAGGED"),
+            (ButtonMapping.right.value, "_NX_RMOUSEDRAGGED"),
+        ],
+    )
+    def test_drag_motion_stays_on_hid_with_the_dragged_type(
+        self,
+        event_bus,
+        mock_stream_handler,
+        mock_mouse_controller,
+        button,
+        expected_type,
+    ):
+        """A held button changes the event type, never the path.
+
+        Falling back to a CGEvent while dragging reintroduces the absolute
+        position, and that made a grabbed cursor drift again as soon as the user
+        held a mouse button in a game. The HID system posts the type we ask for,
+        so the drag survives on the HID path.
+        """
+        from input.mouse import _darwin
+
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        c._pressed = True
+        c._is_dragging = True
+        c._previous_button = button
+        ctx, injector = self._patch_hid(ok=True)
+
+        with (
+            ctx,
+            patch("input.mouse._darwin.CGEventCreateMouseEvent") as create,
+            patch.object(c, "_cursor_position", return_value=(400.0, 300.0)),
+        ):
+            c._inject_relative(7, -5)
+
+        create.assert_not_called(), "no absolute position may be posted while dragging"
+        injector.post.assert_called_once_with(7, -5, getattr(_darwin, expected_type))
+
+    def test_drag_keeps_the_dragged_type_on_the_cgevent_fallback(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """Without the HID path a drag must still arrive as a MouseDragged event."""
+        from input.mouse import _darwin
+
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        c._pressed = True
+        c._is_dragging = True
+        c._previous_button = ButtonMapping.right.value
+        ctx, _ = self._patch_hid(ok=False)
+
+        with (
+            ctx,
+            patch("input.mouse._darwin.CGEventCreateMouseEvent") as create,
+            patch("input.mouse._darwin.CGEventSetIntegerValueField"),
+            patch("input.mouse._darwin.CGEventPost"),
+            patch.object(c, "_cursor_position", return_value=(400.0, 300.0)),
+        ):
+            c._inject_relative(7, -5)
+
+        assert create.call_args.args[1] == _darwin.kCGEventRightMouseDragged
+
+    def test_local_events_suppression_is_disabled_on_init(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """Our own warps must not freeze our own injected motion.
+
+        A warp suppresses local hardware events for 0.25 s, and the HID
+        injection *is* local hardware input - that was the multi-second dead
+        cursor at the crossing point. A failure must not stop the client.
+        """
+        with patch(
+            "input.mouse._darwin.CGSetLocalEventsSuppressionInterval"
+        ) as suppress:
+            self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        suppress.assert_called_once_with(0.0)
+
+        with patch(
+            "input.mouse._darwin.CGSetLocalEventsSuppressionInterval",
+            side_effect=RuntimeError("gone"),
+        ):
+            self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+
+    def test_applied_displacement_is_measured_not_assumed(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """The reported displacement is what the cursor did, per the OS.
+
+        Under the HID path the OS may apply the delta or withhold it entirely
+        (an app holding the pointer), so it is read back rather than assumed.
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        ctx, _ = self._patch_hid(ok=True)
+
+        with ctx, patch.object(c, "_cursor_position") as pos:
+            # First call has no baseline yet, then the cursor follows...
+            pos.side_effect = [(100.0, 100.0), (110.0, 95.0)]
+            assert c._inject_relative(10, -5) == (0, 0)
+            assert c._inject_relative(10, -5) == (10, -5)
+
+            # ...and here it does not move at all: no travel to report.
+            pos.side_effect = [(110.0, 95.0), (110.0, 95.0)]
+            assert c._inject_relative(10, -5) == (0, 0)
+            assert c._inject_relative(10, -5) == (0, 0)
+
+    def test_pushing_at_the_desktop_bound_is_not_a_held_pointer(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """Geometric immobility must not suspend edge routing.
+
+        A cursor against the screen edge does not move when pushed further that
+        way - measured, the OS simply swallows the delta on the HID path. Read
+        as "an app is holding the pointer" it would stop ``_check_edge`` exactly
+        while the user pushes at the edge to hand control back to the server.
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        c._screen_bbox = (0, 0, 1920, 1080)
+        ctx, _ = self._patch_hid(ok=True)
+
+        with (
+            ctx,
+            patch.object(c, "_find_monitor_for_cursor", return_value=None),
+            patch.object(c, "_cursor_position", return_value=(0.0, 500.0)),
+        ):
+            c._inject_relative(-10, 0)  # establishes the baseline
+            for _ in range(6):
+                c._inject_relative(-10, 0)  # pushing left, already at x=0
+                assert c._immobile_moves == 0
+
+            # Same immobility, but with room to move: that IS a held pointer.
+            with patch.object(c, "_cursor_position", return_value=(500.0, 500.0)):
+                c._inject_relative(-10, 0)  # new baseline
+                c._inject_relative(-10, 0)
+                assert c._immobile_moves == 1
+
+    def test_fallback_position_cannot_run_past_the_desktop(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """The CGEvent fallback must not compound past the screen edge.
+
+        A CGEvent carries an absolute location and the read-back is the location
+        we posted, not where the cursor ended up: without a clamp, ``pos + delta``
+        compounds every event (measured: -600 px after 30 pushes at the left
+        edge, while the visible cursor sat still at 0).
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        c._screen_bbox = (0, 0, 1920, 1080)
+        ctx, _ = self._patch_hid(ok=False)
+
+        # The read-back follows what we post, exactly as macOS does here.
+        posted = {"x": 300.0}
+
+        with (
+            ctx,
+            patch("input.mouse._darwin.CGEventCreateMouseEvent") as create,
+            patch("input.mouse._darwin.CGEventSetIntegerValueField"),
+            patch("input.mouse._darwin.CGEventPost"),
+            patch.object(c, "_find_monitor_for_cursor", return_value=None),
+            patch.object(
+                c, "_cursor_position", side_effect=lambda: (posted["x"], 500.0)
+            ),
+        ):
+            for _ in range(30):
+                c._inject_relative(-20, 0)
+                posted["x"] = create.call_args.args[2][0]
+
+        assert posted["x"] == 0.0, "position ran past the desktop bound"
+        assert all(call.args[2][0] >= 0 for call in create.call_args_list)
+
+    def test_immobile_cursor_counts_up_and_resets(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """A pointer the OS won't move is counted, so routing can stand down.
+
+        While an app holds the cursor, ``_detect_edge_via_delta`` would read
+        "pushing at the edge" off deltas that move nothing and then clamp -
+        warping the very cursor the game is keeping still.
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        ctx, _ = self._patch_hid(ok=True)
+
+        with ctx, patch.object(c, "_cursor_position", return_value=(50.0, 50.0)):
+            c._inject_relative(10, 0)  # no baseline yet: unknown, not counted
+            assert c._immobile_moves == 0
+            for expected in (1, 2, 3, 4):
+                c._inject_relative(10, 0)
+                assert c._immobile_moves == expected
+            assert c._immobile_moves >= c.IMMOBILE_MOVES_BEFORE_HOLD
+
+        # A move the OS does apply clears it immediately.
+        with ctx, patch.object(c, "_cursor_position", return_value=(60.0, 50.0)):
+            c._inject_relative(10, 0)
+        assert c._immobile_moves == 0
+
+    @pytest.mark.anyio
+    async def test_edge_routing_stands_down_while_pointer_is_held(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """The worker skips edge detection once the immobile run is long enough.
+
+        Both directions are asserted: a moving cursor must still be routed.
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        c._is_active = True
+        move = MouseEvent(x=-1, y=-1, dx=10, dy=0, action=MouseEvent.MOVE_ACTION)
+
+        async def pump():
+            c._running = True
+            await c._queue.put(MagicMock())
+            worker = asyncio.create_task(c._run_worker())
+            while not c._queue.empty():
+                await asyncio.sleep(0.005)
+            await asyncio.sleep(0.005)
+            c._running = False
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+
+        with (
+            patch("input.mouse._base.EventMapper.get_event", return_value=move),
+            patch.object(c, "_move_cursor"),
+            patch.object(c, "_check_edge", new=AsyncMock()) as check,
+        ):
+            c._immobile_moves = 0
+            await pump()
+            assert check.await_count == 1, "a moving cursor must still be routed"
+
+            check.reset_mock()
+            c._immobile_moves = c.IMMOBILE_MOVES_BEFORE_HOLD
+            await pump()
+            check.assert_not_awaited()
+
+    def test_warp_cursor_generates_no_event(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """Absolute placement uses CGWarpMouseCursorPosition.
+
+        pynput's position setter posts a MouseMoved CGEvent; a landing repeats
+        the placement ten times, which a focused game would read as camera
+        movement. The warp also drops the measurement baseline - a jump is not
+        travel.
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        c._last_seen_pos = (1.0, 2.0)
+        c._immobile_moves = 5
+
+        with (
+            patch("input.mouse._darwin.CGWarpMouseCursorPosition") as warp,
+            patch("input.mouse._darwin.CGEventPost") as post,
+        ):
+            c._warp_cursor(640, 480)
+
+        warp.assert_called_once_with((640.0, 480.0))
+        post.assert_not_called()
+        assert c._last_seen_pos is None
+        assert c._immobile_moves == 0
+
+    def test_cursor_position_reads_the_event_system(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """Reads come from the event system, not from pynput's AppKit value."""
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        mock_mouse_controller.position = (11, 22)
+
+        class _Loc:
+            x, y = 333.0, 444.0
+
+        with (
+            patch("input.mouse._darwin.CGEventCreate", return_value="evt"),
+            patch("input.mouse._darwin.CGEventGetLocation", return_value=_Loc()) as get,
+        ):
+            assert c._cursor_position() == (333.0, 444.0)
+        get.assert_called_once_with("evt")
+
+    @pytest.mark.anyio
+    async def test_activation_retries_a_degraded_injection_path(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """A transient HID failure must not pin the whole session to CGEvents.
+
+        Activation is the one moment where retrying costs nothing: it is not the
+        move path, and control has just arrived.
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        ctx, injector = self._patch_hid(ok=False, failure="IOServiceOpen returned 0x…")
+
+        with ctx:
+            await c._on_client_active(ClientActiveEvent(client_uid="server"))
+            injector.retry.assert_called_once()
+
+            # ...and it must stay off the hot path.
+            injector.retry.reset_mock()
+            with patch.object(c, "_cursor_position", return_value=(1.0, 2.0)):
+                c._inject_relative(3, 0)
+            injector.retry.assert_not_called()
+        await c.stop()
+
+    def test_no_pointer_lock_heuristic_remains(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """Structural regression guard: the visibility heuristic must stay gone.
+
+        It froze the cursor while typing in three successive shapes; macOS
+        exposes no way to tell a game's grab from AppKit's text-field auto-hide,
+        so any reintroduction is a bug, not a tuning problem.
+        """
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        for attr in (
+            "_refresh_pointer_lock",
+            "_release_pointer_lock",
+            "_cursor_is_hidden",
+            "_reveal_transient_hide",
+            "_pointer_locked",
+        ):
+            assert not hasattr(c, attr), attr
+
+    def test_inject_relative_stamps_hid_deltas(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """On the CGEvent fallback the raw dx/dy still ride in the delta fields."""
+        from input.mouse import _darwin
+
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        ctx, _ = self._patch_hid(ok=False)
+
+        with (
+            ctx,
+            patch("input.mouse._darwin.CGEventCreateMouseEvent", return_value="evt"),
+            patch("input.mouse._darwin.CGEventSetIntegerValueField") as stamp,
+            patch("input.mouse._darwin.CGEventPost"),
+            patch.object(c, "_cursor_position", return_value=(10.0, 10.0)),
+        ):
+            c._inject_relative(3, -9)
+
+        stamped = {call.args[1]: call.args[2] for call in stamp.call_args_list}
+        assert stamped[_darwin.kCGMouseEventDeltaX] == 3
+        assert stamped[_darwin.kCGMouseEventDeltaY] == -9
+
+    def test_fallback_posts_a_plain_move_to_the_hid_tap(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        """Completes the fallback matrix: type, tap and source of the position."""
+        from input.mouse import _darwin
+
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        ctx, _ = self._patch_hid(ok=False)
+
+        with (
+            ctx,
+            patch(
+                "input.mouse._darwin.CGEventCreateMouseEvent", return_value="evt"
+            ) as create,
+            patch("input.mouse._darwin.CGEventSetIntegerValueField"),
+            patch("input.mouse._darwin.CGEventPost") as post,
+            patch.object(c, "_cursor_position", return_value=(10.0, 20.0)) as pos,
+        ):
+            c._inject_relative(3, -9)
+
+        assert create.call_args.args[1] == _darwin.kCGEventMouseMoved
+        assert create.call_args.args[2] == (13.0, 11.0)
+        post.assert_called_once_with(_darwin.kCGHIDEventTap, "evt")
+        assert pos.called, "the position must come from the event system"
+
+    @pytest.mark.parametrize("failing", ["read", "post"])
+    def test_fallback_of_the_fallback_is_pynput(
+        self, event_bus, mock_stream_handler, mock_mouse_controller, failing
+    ):
+        """When even the CGEvent path can't run, the cursor must still move."""
+        c = self._make_client(event_bus, mock_stream_handler, mock_mouse_controller)
+        ctx, _ = self._patch_hid(ok=False)
+        create = patch(
+            "input.mouse._darwin.CGEventCreateMouseEvent",
+            side_effect=RuntimeError("no event source"),
+        )
+        position = patch.object(
+            c,
+            "_cursor_position",
+            return_value=None if failing == "read" else (1.0, 2.0),
+        )
+
+        with ctx, create, position:
+            assert c._inject_relative(7, -5) == (7, -5)
+
+        mock_mouse_controller.move.assert_called_once_with(dx=7, dy=-5)
+
+
+# ============================================================================
+# macOS HID injector Tests
+# ============================================================================
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="IOKit-backed HID injection")
+class TestDarwinHIDInjector:
+    """The HID path must degrade to CGEvents loudly, and never silently.
+
+    ``IOHIDPostEvent`` is deprecated, so every one of these failure modes is a
+    plausible future - and the pointer of the whole macOS client rides on it.
+    """
+
+    def _injector(self, **kwargs):
+        from input.mouse import _darwin
+
+        return _darwin._HIDRelativeInjector(**kwargs)
+
+    def test_forced_cgevent_mode_never_opens_iokit(self, monkeypatch):
+        """The escape hatch takes exactly the same path as a real failure."""
+        from input.mouse import _darwin
+
+        monkeypatch.setenv(_darwin.FORCE_CGEVENT_ENV_VAR, "1")
+        injector = self._injector(forced_off=_darwin._forced_cgevent_reason())
+
+        with patch("ctypes.CDLL") as cdll:
+            assert injector.post(5, 0) is False
+        cdll.assert_not_called()
+        assert injector.available is False
+        assert _darwin.FORCE_CGEVENT_ENV_VAR in (injector.take_failure() or "")
+        # Drained: a degradation is reported once, not once per event.
+        assert injector.take_failure() is None
+
+    def test_forced_mode_is_not_retried(self, monkeypatch):
+        """An explicit opt-out must survive activation retries."""
+        from input.mouse import _darwin
+
+        monkeypatch.setenv(_darwin.FORCE_CGEVENT_ENV_VAR, "1")
+        injector = self._injector(forced_off=_darwin._forced_cgevent_reason())
+
+        assert injector.retry(lambda: (0.0, 0.0)) is False
+        assert injector.available is False
+
+    def test_env_var_is_strict_about_its_value(self, monkeypatch):
+        """Same convention as PERPETUA_DAEMON_FORCE_EXIT: only "1" opts in."""
+        from input.mouse import _darwin
+
+        for value in ("0", "true", "yes", ""):
+            monkeypatch.setenv(_darwin.FORCE_CGEVENT_ENV_VAR, value)
+            assert _darwin._forced_cgevent_reason() is None, value
+        monkeypatch.setenv(_darwin.FORCE_CGEVENT_ENV_VAR, "1")
+        assert _darwin._forced_cgevent_reason() is not None
+
+    def test_self_test_disables_when_the_cursor_does_not_move(self):
+        """The failure mode a deprecated API really has: a silent no-op.
+
+        A motionless cursor is indistinguishable from an app holding the
+        pointer, so without this probe the fallback would never engage and the
+        cursor would just stay dead.
+        """
+        injector = self._injector()
+
+        with patch.object(injector, "post", return_value=True) as post:
+            assert injector.verify(lambda: (100.0, 100.0)) is False
+
+        assert injector.available is False
+        assert "did not move" in (injector.take_failure() or "")
+        # It still put the probe delta back before giving up.
+        assert [call.args for call in post.call_args_list] == [(1, 0), (-1, 0)]
+
+    def test_self_test_passes_and_restores_the_cursor(self):
+        """A working path stays available and leaves the cursor where it was."""
+        injector = self._injector()
+        positions = iter([(100.0, 100.0), (101.0, 100.0)])
+
+        with patch.object(injector, "post", return_value=True) as post:
+            assert injector.verify(lambda: next(positions)) is True
+
+        assert injector.available is True
+        assert injector.take_failure() is None
+        assert [call.args for call in post.call_args_list] == [(1, 0), (-1, 0)]
+
+    def test_self_test_waits_for_the_position_to_catch_up(self):
+        """The read lags the injection, so one immediate look is not enough.
+
+        Measured on Darwin 25.5: still unchanged 2 ms after the post, changed by
+        10 ms. Judging on the first read would disable a healthy HID path and
+        silently give up the game fidelity it exists for.
+        """
+        injector = self._injector()
+        # Stale, stale, stale, then the pixel finally lands.
+        positions = iter([(100.0, 100.0)] * 4 + [(101.0, 100.0)])
+
+        with patch.object(injector, "post", return_value=True):
+            assert injector.verify(lambda: next(positions)) is True
+        assert injector.available is True
+
+    def test_self_test_gives_up_after_its_timeout(self):
+        """The polling must be bounded - it runs on the loop at activation."""
+        injector = self._injector()
+
+        with patch.object(injector, "post", return_value=True):
+            started = time.perf_counter()
+            assert injector.verify(lambda: (100.0, 100.0)) is False
+            elapsed = time.perf_counter() - started
+
+        assert elapsed < injector.SELF_TEST_TIMEOUT * 4, "self-test must not hang"
+        assert "did not move" in (injector.take_failure() or "")
+
+    def test_self_test_needs_a_readable_position(self):
+        injector = self._injector()
+        assert injector.verify(lambda: None) is False
+        assert injector.available is False
+        assert "self-test" in (injector.take_failure() or "")
+
+    @pytest.mark.parametrize(
+        "break_at, expected",
+        [
+            ("matching", "IOServiceMatching"),
+            ("service", "service not found"),
+            ("open", "IOServiceOpen returned"),
+            ("raise", "IOServiceOpen failed"),
+        ],
+    )
+    def test_every_open_failure_records_a_reason(self, break_at, expected):
+        """No silent degradation: each way IOKit can fail names itself."""
+        injector = self._injector()
+        iokit = MagicMock()
+        iokit.IOServiceMatching.return_value = 0 if break_at == "matching" else 1234
+        iokit.IOServiceGetMatchingService.return_value = (
+            0 if break_at == "service" else 99
+        )
+        iokit.IOServiceOpen.return_value = 0xE00002C1 if break_at == "open" else 0
+        if break_at == "raise":
+            iokit.IOServiceOpen.side_effect = RuntimeError("boom")
+
+        # Only IOKit is faked: the libSystem lookup for mach_task_self_ is real,
+        # so the failure under test is the only thing that fails.
+        import ctypes as _ctypes
+
+        real_cdll = _ctypes.CDLL
+
+        def cdll(path, *args, **kwargs):
+            if "IOKit" in str(path):
+                return iokit
+            return real_cdll(path, *args, **kwargs)
+
+        with patch("ctypes.CDLL", side_effect=cdll):
+            assert injector.post(1, 0) is False
+
+        assert injector.available is False
+        reason = injector.take_failure()
+        assert reason and expected in reason
+        assert injector.take_failure() is None
+
+    def test_post_failure_records_a_reason(self):
+        """A non-zero IOReturn, or a raising call, hands over to the fallback."""
+        for setup, expected in (
+            (
+                lambda k: setattr(
+                    k, "IOHIDPostEvent", MagicMock(return_value=0xE00002C7)
+                ),
+                "returned 0x",
+            ),
+            (
+                lambda k: setattr(
+                    k, "IOHIDPostEvent", MagicMock(side_effect=OSError("x"))
+                ),
+                "failed - OSError",
+            ),
+        ):
+            injector = self._injector()
+            injector._iokit = MagicMock()
+            injector._opened = True
+            injector._connect = 7
+            setup(injector._iokit)
+
+            assert injector.post(1, 0) is False
+            assert injector.available is False
+            assert expected in (injector.take_failure() or "")
+
+    def test_missing_handle_degrades_with_a_reason(self):
+        """The one branch that used to degrade silently.
+
+        ``available`` was cleared without recording why, so the caller - which
+        only warns when there is a reason - stayed quiet about running on the
+        fallback.
+        """
+        injector = self._injector()
+        injector._opened = True  # "already opened" but no handle: never silent
+        injector._iokit = None
+
+        assert injector.post(1, 0) is False
+        assert injector.available is False
+        assert injector.take_failure(), "degradation must name itself"
+
+    def test_closed_connection_is_not_posted_to(self):
+        """After close() a post must degrade, not target io_connect_t 0."""
+        injector = self._injector()
+        injector._iokit = MagicMock()
+        injector._opened = True
+        injector._connect = 7
+
+        injector.close()
+
+        assert injector.available is False
+        assert injector._iokit is None
+        assert injector.post(1, 0) is False
+
+    def test_retry_reopens_a_degraded_path(self):
+        """A transient failure at daemon start must not pin the whole session."""
+        injector = self._injector()
+        injector._opened = True
+        injector._disable("IOServiceOpen returned 0xE00002C1")
+        assert injector.available is False
+
+        with patch.object(injector, "verify", return_value=True) as verify:
+            assert injector.retry(lambda: (0.0, 0.0)) is True
+
+        verify.assert_called_once()
+        assert injector._opened is False, "a retry must re-open, not reuse the handle"
+        assert injector.available is True
+
+    def test_retry_is_a_no_op_while_the_path_works(self):
+        """Nothing to recover: activation must not disturb a healthy path."""
+        injector = self._injector()
+
+        with patch.object(injector, "verify") as verify:
+            assert injector.retry(lambda: (0.0, 0.0)) is True
+
+        verify.assert_not_called()

@@ -1035,10 +1035,22 @@ class ClientMouseController(object):
     # tagged as a multi-click sequence (double, triple, ...).
     DOUBLE_CLICK_THRESHOLD = 0.4
     MAX_CLICK_COUNT = 10
-    # How often (seconds) the client re-reads the OS cursor-visibility
-    # state to detect a game pointer lock. The result is cached so the
-    # per-move hot path stays a single boolean check.
-    POINTER_LOCK_POLL_INTERVAL = 0.1
+    # Gap (seconds) in the incoming move stream beyond which the position
+    # history is dropped. The history only grows while moves arrive, so a
+    # pause (typing with the mouse still, a game grab) would otherwise leave
+    # it frozen with pre-pause samples and let ``_detect_directed_edge`` vote
+    # on a direction that no longer applies on the very next move.
+    # ``_detect_edge_via_delta`` still covers the current tick.
+    MOVE_STREAM_GAP_SECONDS = 0.15
+    # Consecutive forwarded moves that the OS did not apply to the cursor
+    # before edge routing is suspended. A foreground app holding the pointer
+    # (a game's cursor grab) produces an unbounded run of these: the cursor is
+    # not where routing thinks it is, and ``_detect_edge_via_delta`` would
+    # happily read "pushing at the edge" from deltas that move nothing, then
+    # clamp - warping the cursor the game is trying to keep still. Routing
+    # resumes the moment the cursor moves again. Backends that always apply
+    # the delta (Windows, Linux, the macOS CGEvent fallback) never reach this.
+    IMMOBILE_MOVES_BEFORE_HOLD = 3
     # Hysteresis for the entry-edge return lock. After a crossing the cursor
     # lands ON the entry edge, which is also the edge used to return to the
     # server; a single reverse HID jitter would otherwise bounce control
@@ -1135,12 +1147,19 @@ class ClientMouseController(object):
         self._click_count: int = 0
         self._is_dragging = False
 
-        # Set when a foreground game has taken a pointer lock (cursor
-        # hidden by the game). While locked we inject deltas only and
-        # skip cursor repositioning so we don't fight the game's own
-        # centered lock. Detected read-only via ``_cursor_is_hidden``.
-        self._pointer_locked = False
-        self._pointer_lock_ts: float = 0.0
+        # When the last forwarded move was processed, so a pause in the
+        # stream can invalidate the position history
+        # (``MOVE_STREAM_GAP_SECONDS``).
+        self._last_move_ts: float = 0.0
+        # Cursor position observed at the previous relative injection, for
+        # backends that MEASURE the displacement the OS actually applied
+        # instead of assuming it equals the delta (see the macOS
+        # ``_inject_relative``). Cleared on every absolute placement, whose
+        # jump is not travel.
+        self._last_seen_pos: Optional[tuple[float, float]] = None
+        # Run length of forwarded moves the OS did not apply, maintained by
+        # the backends that can tell (see ``IMMOBILE_MOVES_BEFORE_HOLD``).
+        self._immobile_moves: int = 0
 
         self._logger = get_logger(self.__class__.__name__)
 
@@ -1249,10 +1268,7 @@ class ClientMouseController(object):
     def check_cursor_validity(self) -> bool:
         """Ensure a cursor is available - may fail on Windows when no cursor is present."""
         try:
-            pos = self._controller.position
-            if pos is None or len(pos) != 2:
-                return False
-            return True
+            return self._cursor_position() is not None
         except Exception:
             self._logger.error("cursor not available")
             return False
@@ -1303,12 +1319,22 @@ class ClientMouseController(object):
                     continue
 
                 if event.action == MouseEvent.MOVE_ACTION:
-                    self._refresh_pointer_lock()
+                    # A pause in the stream (typing with the mouse still, a
+                    # game holding the pointer) leaves the position history
+                    # frozen with pre-pause samples - see
+                    # ``MOVE_STREAM_GAP_SECONDS``.
+                    now = time()
+                    if (
+                        self._last_move_ts > 0.0
+                        and now - self._last_move_ts > self.MOVE_STREAM_GAP_SECONDS
+                    ):
+                        self._movement_history.clear()
+                    self._last_move_ts = now
+
                     self._move_cursor(event.x, event.y, event.dx, event.dy)
-                    # While a game holds the pointer lock the cursor is
-                    # pinned/centered by the game; running edge detection
-                    # would read that as drift and clamp/warp against it.
-                    if not self._pointer_locked:
+                    # Routing is meaningless while the OS is withholding our
+                    # motion - see ``IMMOBILE_MOVES_BEFORE_HOLD``.
+                    if self._immobile_moves < self.IMMOBILE_MOVES_BEFORE_HOLD:
                         await self._check_edge()
                 elif event.action == MouseEvent.POSITION_ACTION:
                     # Position multiple times so absolute placement
@@ -1334,6 +1360,10 @@ class ClientMouseController(object):
                 await asyncio.sleep(0.01)
 
     async def _on_client_active(self, data: Optional[ClientActiveEvent]):
+        # Control just arrived: the one moment where retrying a degraded
+        # injection backend costs nothing and can recover the session.
+        self._on_relative_injection_degraded()
+
         if data is not None:
             self._current_screen = data.client_uid
             self._active_monitor_id = data.client_monitor_id
@@ -1349,8 +1379,9 @@ class ClientMouseController(object):
             self._last_known_monitor_id = self._active_monitor_id
         self._movement_history.clear()
         self._last_move_delta = (0, 0)
-        self._pointer_locked = False
-        self._pointer_lock_ts = 0.0
+        self._last_move_ts = 0.0
+        self._last_seen_pos = None
+        self._immobile_moves = 0
 
         # Lock return-to-server against the edge the cursor entered through
         # (server-supplied, else inferred from the landing coords) until it
@@ -1395,8 +1426,9 @@ class ClientMouseController(object):
         self._return_locked_edge = None
         self._inward_travel = 0
         self._return_armed = False
-        self._pointer_locked = False
-        self._pointer_lock_ts = 0.0
+        self._last_move_ts = 0.0
+        self._last_seen_pos = None
+        self._immobile_moves = 0
 
     _STRING_TO_EDGE_CLIENT: dict = {
         "left": ScreenEdge.LEFT,
@@ -1467,14 +1499,19 @@ class ClientMouseController(object):
             span = max_y - min_y
         else:
             return
-        # Clamp to the perpendicular extent of the active monitor: the cursor
-        # is pinned by the OS at the screen edges, but the server keeps
-        # forwarding deltas while the user pushes, so without this the offset
-        # diverges far past the monitor and a real return sweep can never bring
-        # it back into the release band (control gets stuck on the client). The
-        # 0 floor also self-resyncs: pushing into the entry edge drives it to 0
-        # so the return gate reliably opens there. Skip on a degenerate bbox,
-        # else the floor would cap arming at 0.
+        # Clamp to the perpendicular extent of the active monitor. The ceiling
+        # is load-bearing for the backends that credit the RAW delta (Windows,
+        # Linux): the cursor is pinned by the OS at the screen edges, but the
+        # server keeps forwarding deltas while the user pushes, so without it
+        # the offset diverges far past the monitor and a real return sweep can
+        # never bring it back into the release band (control gets stuck on the
+        # client). Where the applied displacement is MEASURED instead (macOS)
+        # the offset stops growing on its own - the OS swallows the delta at
+        # the edge, so ``applied`` is (0, 0) - and the ceiling is belt and
+        # braces. The 0 floor is needed everywhere: it self-resyncs, since
+        # pushing into the entry edge drives the offset to 0 so the return gate
+        # reliably opens there. Skip on a degenerate bbox, else the floor would
+        # cap arming at 0.
         if span > 0:
             self._inward_travel = max(0, min(span, self._inward_travel))
         if self._inward_travel >= self.RETURN_ARM_MARGIN:
@@ -1834,18 +1871,31 @@ class ClientMouseController(object):
         return None
 
     def _clamp_cursor_to_monitor(self, monitor) -> None:
-        """Pin the cursor just inside ``monitor``'s bbox."""
+        """Bring the cursor back INSIDE ``monitor`` when it has actually left it.
+
+        Only genuinely out-of-bounds positions are moved, and only onto the
+        nearest valid pixel. Sitting *on* the boundary pixel is not "outside":
+        the OS already holds the cursor at the desktop bound, so nudging it a
+        pixel inward there would fight the system - the user pushes, the OS
+        pins at the bound, we warp inward, every tick - which is visible as the
+        cursor bouncing off the edge. Whatever we need to know about the edge
+        we compute from the position; we don't restate it by moving the cursor.
+
+        What is left to this method is the case the OS does *not* handle: a
+        cursor that drifted onto another monitor of this client, or into an
+        L-shaped dead zone (see the ``_handle_os_drift`` callers).
+        """
         if monitor is None:
             return
         try:
-            pos = self._controller.position
-            if not pos or len(pos) != 2:
+            pos = self._cursor_position()
+            if pos is None:
                 return
             cx, cy = pos
-            new_x = max(monitor.min_x + 1, min(monitor.max_x - 2, cx))
-            new_y = max(monitor.min_y + 1, min(monitor.max_y - 2, cy))
+            new_x = max(monitor.min_x, min(monitor.max_x - 1, cx))
+            new_y = max(monitor.min_y, min(monitor.max_y - 1, cy))
             if (new_x, new_y) != (cx, cy):
-                self._controller.position = (new_x, new_y)
+                self._warp_cursor(new_x, new_y)
         except Exception as e:
             self._logger.error("failed to clamp cursor to monitor", error=str(e))
 
@@ -1891,8 +1941,8 @@ class ClientMouseController(object):
 
                 self._checking_edge = True
 
-                pos = self._controller.position
-                if pos is None or len(pos) != 2:
+                pos = self._cursor_position()
+                if pos is None:
                     return None
                 x, y = pos
                 self._movement_history.append((x, y))
@@ -2029,8 +2079,8 @@ class ClientMouseController(object):
                 return True
 
         self._clamp_cursor_to_monitor(previous)
-        pos = self._controller.position
-        if pos and len(pos) == 2:
+        pos = self._cursor_position()
+        if pos is not None:
             nx, ny = pos
             self._movement_history.clear()
             self._movement_history.append((nx, ny))
@@ -2061,7 +2111,7 @@ class ClientMouseController(object):
             return False
         dst_monitor_id, target_x, target_y, dst_edge = warp
         try:
-            self._controller.position = (int(target_x), int(target_y))
+            self._warp_cursor(int(target_x), int(target_y))
         except Exception as e:
             self._logger.error("failed to warp cursor intra-client", error=str(e))
             return True
@@ -2101,7 +2151,7 @@ class ClientMouseController(object):
             return
 
         try:
-            self._controller.position = (x, y)
+            self._warp_cursor(x, y)
             await asyncio.sleep(0)
         except Exception as e:
             self._logger.error("failed to position cursor", error=str(e))
@@ -2120,12 +2170,17 @@ class ClientMouseController(object):
                 dy = 0
 
             # Cached so ``_check_edge`` can detect a push toward an edge
-            # when OS clamping has stalled the position history.
+            # when OS clamping has stalled the position history. Stays the
+            # RAW delta: it is a direction hint for ``_detect_edge_via_delta``,
+            # not a measure of displacement.
             self._last_move_delta = (dx, dy)
-            # Advance the return lockout from the raw HID delta (lag-free,
-            # unlike the async cursor read-back).
-            self._accumulate_inward_travel(dx, dy)
-            self._inject_relative(dx, dy)
+            # Inject first, then advance the return lockout from what the
+            # backend actually applied to the cursor - under a pointer lock
+            # macOS pins the event, so the raw delta would credit travel the
+            # cursor never made, saturate ``_inward_travel`` and latch
+            # ``_return_armed`` (see ``_accumulate_inward_travel``).
+            applied = self._inject_relative(dx, dy)
+            self._accumulate_inward_travel(*applied)
         else:
             try:
                 min_x, min_y, max_x, max_y = self._active_target_bbox
@@ -2139,49 +2194,101 @@ class ClientMouseController(object):
                 return
 
             try:
-                self._controller.position = (x, y)
+                self._warp_cursor(x, y)
             except Exception as e:
                 self._logger.error("failed to position cursor", error=str(e))
 
-    def _cursor_is_hidden(self) -> bool:
-        """Return True if the OS cursor is currently hidden.
+    def _on_relative_injection_degraded(self) -> None:
+        """Hook: give a degraded injection backend one chance to recover.
 
-        Read-only probe used to detect a game pointer lock (games hide
-        the cursor when they grab it). The default is ``False`` so
-        platforms without a detection backend (Linux/X11, dummy) keep
-        the normal absolute-follow behaviour. macOS/Windows override it.
+        Called on activation only - never from the move path - so a backend
+        whose native injection failed transiently (at daemon start, at the login
+        window) isn't pinned to its fallback for the whole session. No-op by
+        default; macOS uses it to re-arm the HID path.
         """
-        return False
+        return None
 
-    def _refresh_pointer_lock(self) -> None:
-        """Throttled refresh of ``self._pointer_locked``.
+    def _motion_bounds(self, x: float, y: float) -> tuple[int, int, int, int]:
+        """The box the cursor can move in from ``(x, y)``.
 
-        Called on every forwarded move but re-reads the OS cursor state
-        at most once per ``POINTER_LOCK_POLL_INTERVAL`` so the hot path
-        stays cheap.
+        The monitor under the cursor when there is one - a taller neighbour
+        makes the desktop union bigger than where the cursor can actually go -
+        else the whole virtual desktop.
         """
-        now = time()
-        if now - self._pointer_lock_ts < self.POINTER_LOCK_POLL_INTERVAL:
-            return
-        self._pointer_lock_ts = now
+        monitor = self._find_monitor_for_cursor(x, y)
+        if monitor is not None:
+            return (monitor.min_x, monitor.min_y, monitor.max_x, monitor.max_y)
+        return self._screen_bbox
+
+    def _motion_is_bounded(self, x: float, y: float, dx: int, dy: int) -> bool:
+        """True when the OS is expected to swallow this delta.
+
+        A cursor already against a bound does not move when pushed further that
+        way: the displacement is zero for a reason we can *see*, unlike a
+        foreground app holding the pointer. Backends that measure the applied
+        displacement use this to keep the two apart - counting the geometric
+        case as a held pointer would suspend edge routing exactly while the user
+        is pushing at the edge to hand control back to the server.
+        """
+        min_x, min_y, max_x, max_y = self._motion_bounds(x, y)
+
+        def blocked(pos: float, delta: int, low: int, high: int) -> bool:
+            if delta == 0:
+                return True  # nothing was requested on this axis
+            return (delta < 0 and pos <= low) or (delta > 0 and pos >= high - 1)
+
+        return blocked(x, dx, min_x, max_x) and blocked(y, dy, min_y, max_y)
+
+    def _cursor_position(self) -> Optional[tuple[float, float]]:
+        """Current cursor position, or ``None`` when it can't be read.
+
+        Every read on the client path goes through here so a backend can keep
+        it in the same event space as its injection - see the macOS override,
+        where mixing an AppKit-level read with an HID-level write is what used
+        to make the cursor drift.
+        """
         try:
-            self._pointer_locked = self._cursor_is_hidden()
-        except Exception:
-            self._pointer_locked = False
+            pos = self._controller.position
+        except Exception as e:
+            self._logger.error("failed to read cursor position", error=str(e))
+            return None
+        if pos is None or len(pos) != 2:
+            return None
+        return float(pos[0]), float(pos[1])
 
-    def _inject_relative(self, dx: int, dy: int) -> None:
+    def _warp_cursor(self, x: float | int, y: float | int) -> None:
+        """Place the cursor at absolute ``(x, y)``.
+
+        Counterpart of ``_cursor_position``: every absolute placement on the
+        client path goes through here (landing, clamp, intra-client warp), which
+        is also why the measured-displacement baseline is dropped here - a warp
+        is not travel.
+        """
+        self._last_seen_pos = None
+        self._immobile_moves = 0
+        self._controller.position = (x, y)
+
+    def _inject_relative(self, dx: int, dy: int) -> tuple[int, int]:
         """Inject a relative pointer motion of ``(dx, dy)``.
+
+        Returns the displacement actually applied to the visible cursor,
+        which is what ``_move_cursor`` feeds to ``_accumulate_inward_travel``
+        - a backend whose motion the OS may withhold (macOS under a game's
+        cursor grab) must report what really happened, or the return-lock
+        offset drifts away from the real cursor position.
 
         The default implementation delegates to pynput's ``Controller.move``.
         On macOS and Windows pynput implements this as an *absolute* warp
         (read current position, set ``position = pos + delta``), which
         first-person games reading raw/relative HID movement do not see —
-        only the visible cursor moves. Those backends override this hook to
-        post a genuine relative-motion event (CGEvent deltas / SendInput
-        ``MOUSEEVENTF_MOVE``). Linux/Wayland (libei) already moves relatively
-        and uses this default.
+        only the visible cursor moves. Those backends override this hook with
+        genuine relative motion: macOS through the HID system
+        (``IOHIDPostEvent``, so a game's cursor grab is honoured by the OS),
+        Windows through ``SendInput`` with ``MOUSEEVENTF_MOVE``. Linux/Wayland
+        (libei) already moves relatively and uses this default.
         """
         self._controller.move(dx=dx, dy=dy)
+        return (dx, dy)
 
     def _click(self, button: int | None, is_pressed: bool):
         """Forward press/release to the OS, tagging multi-click sequences.
