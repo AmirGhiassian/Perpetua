@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend
 import datetime
 import ipaddress
+import re
 
 from config import ApplicationConfig
 from utils.fs import atomic_write_bytes
@@ -41,6 +42,13 @@ _decoder = msgspec.json.Decoder()
 # nothing security-wise (the certs live for 365+ days) and is exactly what
 # public CAs do. Kept generous to tolerate manually mis-set clocks.
 CLOCK_SKEW_TOLERANCE = datetime.timedelta(hours=3)
+_DNS_LABEL_RE = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+# Maximum length of a fully qualified DNS name (RFC 1035).
+_DNS_NAME_MAX_LEN = 253
+# X.509 caps a Common Name at 64 characters; ``cryptography`` rejects anything
+# longer with a ValueError. SubjectAlternativeName has no such limit, so a long
+# FQDN stays intact in the SAN and only the CN is clamped.
+_COMMON_NAME_MAX_LEN = 64
 
 
 def _validity_window(
@@ -59,6 +67,49 @@ def _validity_window(
     """
     not_before = datetime.datetime.now(datetime.UTC) - CLOCK_SKEW_TOLERANCE
     return not_before, not_before + lifetime
+
+
+def _dns_name(value: str) -> Optional[str]:
+    """Return an ASCII DNS name suitable for x509, or ``None``."""
+    name = str(value).strip().strip(".")
+    if not name:
+        return None
+    try:
+        name = name.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    if len(name) > _DNS_NAME_MAX_LEN:
+        return None
+    labels = name.split(".")
+    if all(_DNS_LABEL_RE.match(label) for label in labels):
+        return name
+    return None
+
+
+def _fallback_hostname() -> str:
+    return f"{ApplicationConfig.service_name.lower()}.local"
+
+
+def _certificate_hostname(hostname: str) -> str:
+    """Sanitize the OS hostname before using it in certificate fields (SAN)."""
+    return _dns_name(hostname) or _fallback_hostname()
+
+
+def _common_name(cert_hostname: str) -> str:
+    """Clamp an already-sanitized DNS name to the 64-char Common Name limit.
+
+    A machine whose FQDN is long but whose labels are individually valid (common
+    on CI runners and corporate networks) would otherwise make certificate
+    generation fail outright. Prefer the first label — still a meaningful
+    identity — and only fall back to the generic name if that does not fit.
+    """
+    if len(cert_hostname) <= _COMMON_NAME_MAX_LEN:
+        return cert_hostname
+
+    first_label = _dns_name(cert_hostname.split(".", 1)[0])
+    if first_label is not None and len(first_label) <= _COMMON_NAME_MAX_LEN:
+        return first_label
+    return _fallback_hostname()
 
 
 class CertificateManager:
@@ -81,7 +132,10 @@ class CertificateManager:
 
     def generate_ca(self, force: bool = False) -> bool:
         """Generate CA certificate if it doesn't exist"""
-        if self.ca_cert_path.exists() and not force:
+        # Both halves must be present: signing a leaf needs the key, so a
+        # cert-only directory is not a usable CA and must be regenerated
+        # (otherwise generate_server_certificate fails opening ca.key).
+        if self.ca_cert_path.exists() and self.ca_key_path.exists() and not force:
             return True
 
         try:
@@ -166,13 +220,23 @@ class CertificateManager:
                 public_exponent=65537, key_size=2048, backend=default_backend()
             )
 
+            cert_hostname = _certificate_hostname(hostname)
+
             # Create Subject Alternative Names (SAN)
-            san_list: list[DNSName | IPAddress] = [x509.DNSName(hostname)]
+            san_list: list[DNSName | IPAddress] = [x509.DNSName(cert_hostname)]
             for ip in ip_addresses:
                 try:
                     san_list.append(x509.IPAddress(ipaddress.ip_address(ip)))
                 except ValueError:
-                    san_list.append(x509.DNSName(ip))
+                    dns_name = _dns_name(ip)
+                    if dns_name is not None:
+                        san_list.append(x509.DNSName(dns_name))
+                    else:
+                        self._logger.warning(
+                            "Skipping invalid DNS SAN while generating "
+                            "server certificate",
+                            dns_name=ip,
+                        )
 
             # Create server certificate
             subject = x509.Name(
@@ -181,7 +245,9 @@ class CertificateManager:
                     x509.NameAttribute(
                         NameOID.ORGANIZATION_NAME, ApplicationConfig.service_name
                     ),
-                    x509.NameAttribute(NameOID.COMMON_NAME, hostname),
+                    x509.NameAttribute(
+                        NameOID.COMMON_NAME, _common_name(cert_hostname)
+                    ),
                 ]
             )
 
@@ -226,7 +292,11 @@ class CertificateManager:
 
             return True
         except Exception as e:
-            self._logger.error("Server certificate generation error", error=str(e))
+            self._logger.error(
+                "Server certificate generation error",
+                error=str(e),
+                hostname=hostname,
+            )
             return False
 
     # Placeholder CN used in the client CSR: the client does NOT choose its own
