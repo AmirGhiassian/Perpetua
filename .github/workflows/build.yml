@@ -4,9 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       update-release:
-        description: "Update assets of the latest release"
+        description: "Upload build assets to a release"
         type: boolean
         default: false
+      release-tag:
+        description: "Release tag to update. Use alpha for the pre-release; empty uses the latest release."
+        type: string
+        required: false
+        default: ""
   release:
     types: [published]
 
@@ -478,17 +483,27 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Get latest release tag
-        if: inputs.update-release
-        id: latest-release
+      - name: Resolve release tag
+        id: release-tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "tag=$(gh release view --repo ${{ github.repository }} --json tagName -q .tagName)" >> "$GITHUB_OUTPUT"
+          INPUT_RELEASE_TAG: ${{ inputs.release-tag }}
+          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -eu
+          if [ -n "$EVENT_RELEASE_TAG" ]; then
+            tag="$EVENT_RELEASE_TAG"
+          elif [ -n "$INPUT_RELEASE_TAG" ]; then
+            tag="$INPUT_RELEASE_TAG"
+          else
+            tag="$(gh release view --repo "${{ github.repository }}" --json tagName -q .tagName)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.latest-release.outputs.tag || github.event.release.tag_name }}
+          tag_name: ${{ steps.release-tag.outputs.tag }}
           files: |
             artifacts/*.zip
             artifacts/*.deb
