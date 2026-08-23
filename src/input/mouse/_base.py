@@ -466,9 +466,7 @@ class ServerMouseListener(object):
             or data.exit_edge not in {"left", "right", "top", "bottom"}
             or not 0.0 <= data.axis_position <= 1.0
         ):
-            await self._return_failed_crossing_to_server(
-                self._active_client_uid or ""
-            )
+            await self._return_failed_crossing_to_server(self._active_client_uid or "")
             return
 
         binding = next(
