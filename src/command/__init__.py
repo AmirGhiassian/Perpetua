@@ -29,6 +29,8 @@ from event import (
     ClientTopologyUpdatedEvent,
     CrossScreenCommandEvent,
     ClientActiveEvent,
+    ClientCrossingRequestCommandEvent,
+    ClientCrossingRequestEvent,
     ForceScreenChangeCommandEvent,
 )
 from event.bus import EventBus
@@ -65,6 +67,8 @@ class CommandHandler:
                 await self.handle_client_topology(event)
             elif event.command == CommandEvent.CLIENT_MONITORS_UPDATE:
                 await self.handle_client_monitors_update(event)
+            elif event.command == CommandEvent.CLIENT_CROSSING_REQUEST:
+                await self.handle_client_crossing_request(event)
             else:
                 self._logger.warning("Unknown command received", command=event.command)
                 return
@@ -120,6 +124,20 @@ class CommandHandler:
                 edge_bindings=topo.get_edge_bindings(),
                 server_bbox=topo.get_server_bbox(),
                 intra_client_bindings=topo.get_intra_client_bindings(),
+                inter_client_bindings=topo.get_inter_client_bindings(),
+            ),
+        )
+
+    async def handle_client_crossing_request(self, event: CommandEvent):
+        """Forward a source-only crossing request to the server coordinator."""
+        request = ClientCrossingRequestCommandEvent.from_command_event(event)
+        await self.event_bus.dispatch(
+            event_type=BusEventType.CLIENT_CROSSING_REQUEST,
+            data=ClientCrossingRequestEvent(
+                client_uid=event.source,
+                source_monitor_id=request.params["source_monitor_id"],
+                exit_edge=request.params["exit_edge"],
+                axis_position=request.params["axis_position"],
             ),
         )
 

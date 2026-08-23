@@ -117,6 +117,7 @@ class DaemonCommand(StrEnum):
     LIST_PENDING_APPROVALS = "list_pending_approvals"
     # Multi-monitor layout (server only)
     SET_CLIENT_LAYOUT = "set_client_layout"
+    SET_WORKSPACE_LAYOUT = "set_workspace_layout"
 
     # SSL/Certificate management
     ENABLE_SSL = "enable_ssl"
@@ -2279,6 +2280,34 @@ class Daemon:
                     "client_uid": updated.uid,
                     "net_id": updated.get_net_id(),
                     "placements": list(updated.placements),
+                },
+            )
+        except Exception as e:
+            await self._notification_manager.notify_command_error(command, f"{str(e)}")
+
+    @CommandHandler.register(DaemonCommand.SET_WORKSPACE_LAYOUT)
+    async def _handle_set_workspace_layout(self, params: Dict[str, Any]) -> None:
+        """Atomically persist the complete shared workspace."""
+        command = DaemonCommand.SET_WORKSPACE_LAYOUT.value
+        if not self._server:
+            await self._notification_manager.notify_command_error(
+                command, "Server is not enabled"
+            )
+            return
+        try:
+            placements = params.get("placements", []) or []
+            updated = await self._server.set_workspace_layout(placements)
+            await self._notification_manager.notify_command_success(
+                command,
+                "Workspace layout updated",
+                result_data={
+                    "clients": [
+                        {
+                            "client_uid": client.uid,
+                            "placements": list(client.placements),
+                        }
+                        for client in updated
+                    ]
                 },
             )
         except Exception as e:

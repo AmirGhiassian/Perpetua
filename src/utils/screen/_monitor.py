@@ -408,6 +408,169 @@ class EdgeBinding:
         }
 
 
+@dataclass(frozen=True)
+class InterClientBinding:
+    """One ordered adjacency from a monitor on one client to another client."""
+
+    src_client_uid: str
+    src_monitor_id: int
+    src_edge: Edge
+    src_axis_start: float
+    src_axis_end: float
+    dst_client_uid: str
+    dst_monitor_id: int
+    dst_edge: Edge
+    dst_axis_start: float
+    dst_axis_end: float
+
+    def contains_src_axis(self, axis_norm: float) -> bool:
+        return self.src_axis_start <= axis_norm < self.src_axis_end
+
+    def map_src_to_dst_axis(self, axis_norm: float) -> float:
+        span = self.src_axis_end - self.src_axis_start
+        if span <= 0:
+            return self.dst_axis_start
+        local = max(0.0, min(1.0, (axis_norm - self.src_axis_start) / span))
+        return self.dst_axis_start + local * (
+            self.dst_axis_end - self.dst_axis_start
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "src_client_uid": self.src_client_uid,
+            "src_monitor_id": self.src_monitor_id,
+            "src_edge": self.src_edge.value,
+            "src_axis_start": self.src_axis_start,
+            "src_axis_end": self.src_axis_end,
+            "dst_client_uid": self.dst_client_uid,
+            "dst_monitor_id": self.dst_monitor_id,
+            "dst_edge": self.dst_edge.value,
+            "dst_axis_start": self.dst_axis_start,
+            "dst_axis_end": self.dst_axis_end,
+        }
+
+
+def _ordered_rect_abutments(p: dict, q: dict) -> list[dict]:
+    """Return normalized ordered edge mappings from rectangle ``p`` to ``q``."""
+    try:
+        px = int(p["workspace_x"])
+        py = int(p["workspace_y"])
+        pw = int(p["width"])
+        ph = int(p["height"])
+        qx = int(q["workspace_x"])
+        qy = int(q["workspace_y"])
+        qw = int(q["width"])
+        qh = int(q["height"])
+    except (KeyError, TypeError, ValueError):
+        return []
+    if pw <= 0 or ph <= 0 or qw <= 0 or qh <= 0:
+        return []
+
+    out: list[dict] = []
+
+    def append(
+        src_edge: Edge,
+        dst_edge: Edge,
+        overlap_start: int,
+        overlap_end: int,
+        src_origin: int,
+        src_span: int,
+        dst_origin: int,
+        dst_span: int,
+    ) -> None:
+        if overlap_end <= overlap_start:
+            return
+        out.append(
+            {
+                "src_edge": src_edge,
+                "src_axis_start": (overlap_start - src_origin) / src_span,
+                "src_axis_end": (overlap_end - src_origin) / src_span,
+                "dst_edge": dst_edge,
+                "dst_axis_start": (overlap_start - dst_origin) / dst_span,
+                "dst_axis_end": (overlap_end - dst_origin) / dst_span,
+            }
+        )
+
+    if abs((px + pw) - qx) <= _ABUTMENT_TOLERANCE_PX:
+        append(Edge.RIGHT, Edge.LEFT, max(py, qy), min(py + ph, qy + qh), py, ph, qy, qh)
+    if abs(px - (qx + qw)) <= _ABUTMENT_TOLERANCE_PX:
+        append(Edge.LEFT, Edge.RIGHT, max(py, qy), min(py + ph, qy + qh), py, ph, qy, qh)
+    if abs((py + ph) - qy) <= _ABUTMENT_TOLERANCE_PX:
+        append(Edge.BOTTOM, Edge.TOP, max(px, qx), min(px + pw, qx + qw), px, pw, qx, qw)
+    if abs(py - (qy + qh)) <= _ABUTMENT_TOLERANCE_PX:
+        append(Edge.TOP, Edge.BOTTOM, max(px, qx), min(px + pw, qx + qw), px, pw, qx, qw)
+    return out
+
+
+def compute_inter_client_bindings(
+    placements: "Iterable[dict] | list[dict]",
+) -> list[InterClientBinding]:
+    """Derive every ordered abutment between placements owned by different clients."""
+    placements = list(placements)
+    out: list[InterClientBinding] = []
+    for p in placements:
+        try:
+            src_uid = str(p["client_uid"])
+            src_monitor_id = int(p["client_monitor_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not src_uid:
+            continue
+        for q in placements:
+            try:
+                dst_uid = str(q["client_uid"])
+                dst_monitor_id = int(q["client_monitor_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not dst_uid or dst_uid == src_uid:
+                continue
+            for mapping in _ordered_rect_abutments(p, q):
+                out.append(
+                    InterClientBinding(
+                        src_client_uid=src_uid,
+                        src_monitor_id=src_monitor_id,
+                        src_edge=mapping["src_edge"],
+                        src_axis_start=mapping["src_axis_start"],
+                        src_axis_end=mapping["src_axis_end"],
+                        dst_client_uid=dst_uid,
+                        dst_monitor_id=dst_monitor_id,
+                        dst_edge=mapping["dst_edge"],
+                        dst_axis_start=mapping["dst_axis_start"],
+                        dst_axis_end=mapping["dst_axis_end"],
+                    )
+                )
+    return out
+
+
+def connected_placement_indices(
+    placements: "Iterable[dict] | list[dict]",
+    server_monitors: "Iterable[MonitorInfo] | list[MonitorInfo]",
+) -> set[int]:
+    """Indices in placement components transitively connected to a server monitor."""
+    placements = list(placements)
+    server_monitors = list(server_monitors)
+    if not server_monitors:
+        return set(range(len(placements)))
+
+    connected = {
+        i for i, placement in enumerate(placements)
+        if compute_edge_bindings(placement, server_monitors)
+    }
+    changed = True
+    while changed:
+        changed = False
+        for i, placement in enumerate(placements):
+            if i in connected:
+                continue
+            if any(
+                _ordered_rect_abutments(placement, placements[j])
+                for j in connected
+            ):
+                connected.add(i)
+                changed = True
+    return connected
+
+
 def _make_binding(
     s,
     server_edge: Edge,
@@ -609,89 +772,22 @@ def compute_intra_client_bindings(
             dst_os = os_bbox_by_id.get(q_id, (qx, qy, qx + qw, qy + qh))
             dst_min_x, dst_min_y, dst_max_x, dst_max_y = dst_os
 
-            # p.RIGHT abuts q.LEFT
-            if abs((px + pw) - qx) <= _ABUTMENT_TOLERANCE_PX:
-                y_start = max(py, qy)
-                y_end = min(py + ph, qy + qh)
-                if y_end > y_start:
-                    out.append(
-                        {
-                            "src_monitor_id": p_id,
-                            "src_edge": Edge.RIGHT.value,
-                            "src_axis_start": (y_start - py) / ph,
-                            "src_axis_end": (y_end - py) / ph,
-                            "dst_monitor_id": q_id,
-                            "dst_edge": Edge.LEFT.value,
-                            "dst_axis_start": (y_start - qy) / qh,
-                            "dst_axis_end": (y_end - qy) / qh,
-                            "dst_monitor_min_x": dst_min_x,
-                            "dst_monitor_min_y": dst_min_y,
-                            "dst_monitor_max_x": dst_max_x,
-                            "dst_monitor_max_y": dst_max_y,
-                        }
-                    )
-            # p.LEFT abuts q.RIGHT
-            if abs(px - (qx + qw)) <= _ABUTMENT_TOLERANCE_PX:
-                y_start = max(py, qy)
-                y_end = min(py + ph, qy + qh)
-                if y_end > y_start:
-                    out.append(
-                        {
-                            "src_monitor_id": p_id,
-                            "src_edge": Edge.LEFT.value,
-                            "src_axis_start": (y_start - py) / ph,
-                            "src_axis_end": (y_end - py) / ph,
-                            "dst_monitor_id": q_id,
-                            "dst_edge": Edge.RIGHT.value,
-                            "dst_axis_start": (y_start - qy) / qh,
-                            "dst_axis_end": (y_end - qy) / qh,
-                            "dst_monitor_min_x": dst_min_x,
-                            "dst_monitor_min_y": dst_min_y,
-                            "dst_monitor_max_x": dst_max_x,
-                            "dst_monitor_max_y": dst_max_y,
-                        }
-                    )
-            # p.BOTTOM abuts q.TOP
-            if abs((py + ph) - qy) <= _ABUTMENT_TOLERANCE_PX:
-                x_start = max(px, qx)
-                x_end = min(px + pw, qx + qw)
-                if x_end > x_start:
-                    out.append(
-                        {
-                            "src_monitor_id": p_id,
-                            "src_edge": Edge.BOTTOM.value,
-                            "src_axis_start": (x_start - px) / pw,
-                            "src_axis_end": (x_end - px) / pw,
-                            "dst_monitor_id": q_id,
-                            "dst_edge": Edge.TOP.value,
-                            "dst_axis_start": (x_start - qx) / qw,
-                            "dst_axis_end": (x_end - qx) / qw,
-                            "dst_monitor_min_x": dst_min_x,
-                            "dst_monitor_min_y": dst_min_y,
-                            "dst_monitor_max_x": dst_max_x,
-                            "dst_monitor_max_y": dst_max_y,
-                        }
-                    )
-            # p.TOP abuts q.BOTTOM
-            if abs(py - (qy + qh)) <= _ABUTMENT_TOLERANCE_PX:
-                x_start = max(px, qx)
-                x_end = min(px + pw, qx + qw)
-                if x_end > x_start:
-                    out.append(
-                        {
-                            "src_monitor_id": p_id,
-                            "src_edge": Edge.TOP.value,
-                            "src_axis_start": (x_start - px) / pw,
-                            "src_axis_end": (x_end - px) / pw,
-                            "dst_monitor_id": q_id,
-                            "dst_edge": Edge.BOTTOM.value,
-                            "dst_axis_start": (x_start - qx) / qw,
-                            "dst_axis_end": (x_end - qx) / qw,
-                            "dst_monitor_min_x": dst_min_x,
-                            "dst_monitor_min_y": dst_min_y,
-                            "dst_monitor_max_x": dst_max_x,
-                            "dst_monitor_max_y": dst_max_y,
-                        }
-                    )
+            for mapping in _ordered_rect_abutments(p, q):
+                out.append(
+                    {
+                        "src_monitor_id": p_id,
+                        "src_edge": mapping["src_edge"].value,
+                        "src_axis_start": mapping["src_axis_start"],
+                        "src_axis_end": mapping["src_axis_end"],
+                        "dst_monitor_id": q_id,
+                        "dst_edge": mapping["dst_edge"].value,
+                        "dst_axis_start": mapping["dst_axis_start"],
+                        "dst_axis_end": mapping["dst_axis_end"],
+                        "dst_monitor_min_x": dst_min_x,
+                        "dst_monitor_min_y": dst_min_y,
+                        "dst_monitor_max_x": dst_max_x,
+                        "dst_monitor_max_y": dst_max_y,
+                    }
+                )
 
     return out

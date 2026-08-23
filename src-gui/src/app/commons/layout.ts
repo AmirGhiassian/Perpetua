@@ -389,13 +389,13 @@ export function snapRect(
 export interface PlacementValidationResult {
     ok: boolean;
     overlappingIndices: Set<number>;
+    notConnectedToServerIndices: Set<number>;
+    /** @deprecated Use notConnectedToServerIndices. */
     notAdjacentToServerIndices: Set<number>;
     errors: string[];
 }
 
-// Reject placements overlapping a server monitor, overlapping each other,
-// or not abutting any server monitor (chained client-only hops break the
-// reverse-routing path back to the server).
+// Reject overlaps and placement components that cannot reach a server monitor.
 export function validatePlacements(
     serverMonitors: MonitorInfo[],
     placements: MonitorPlacement[],
@@ -417,15 +417,6 @@ export function validatePlacements(
                 break;
             }
         }
-        // Server-adjacency rule. Skipped while serverRects is empty so
-        // legacy clients without server monitor info don't fail outright.
-        if (serverRects.length > 0 && !isAdjacentToAny(r, serverRects)) {
-            notAdjacent.add(i);
-            errors.push(
-                `Client ${p.client_uid} monitor ${p.client_monitor_id} `
-                + `is not adjacent to any server monitor`,
-            );
-        }
     });
 
     for (let i = 0; i < placements.length; i++) {
@@ -438,12 +429,44 @@ export function validatePlacements(
                     + `overlaps ${placements[j].client_uid}/${placements[j].client_monitor_id}`,
                 );
             }
+
+            if (serverRects.length > 0) {
+                const connected = new Set<number>();
+                placements.forEach((placement, index) => {
+                    if (isAdjacentToAny(placementAsRect(placement), serverRects)) {
+                        connected.add(index);
+                    }
+                });
+                let changed = true;
+                while (changed) {
+                    changed = false;
+                    placements.forEach((placement, index) => {
+                        if (connected.has(index)) return;
+                        const rect = placementAsRect(placement);
+                        if ([...connected].some((other) =>
+                            rectsAdjacent(rect, placementAsRect(placements[other]))
+                        )) {
+                            connected.add(index);
+                            changed = true;
+                        }
+                    });
+                }
+                placements.forEach((placement, index) => {
+                    if (connected.has(index)) return;
+                    notAdjacent.add(index);
+                    errors.push(
+                        `Client ${placement.client_uid} monitor ${placement.client_monitor_id} `
+                        + `is not connected to the server topology`,
+                    );
+                });
+            }
         }
     }
 
     return {
         ok: errors.length === 0,
         overlappingIndices: overlapping,
+        notConnectedToServerIndices: notAdjacent,
         notAdjacentToServerIndices: notAdjacent,
         errors,
     };

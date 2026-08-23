@@ -537,6 +537,7 @@ pub fn run(daemon_config: Option<DaemonConfig>, start_minimized: bool) {
             commands::remove_client,
             commands::set_server_config,
             commands::set_client_layout,
+            commands::set_workspace_layout,
             // -- Client Commands --
             commands::start_client,
             commands::stop_client,

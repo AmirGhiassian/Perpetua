@@ -73,6 +73,22 @@ export function setClientLayout(
     });
 }
 
+/** Atomically validate and persist the complete shared workspace. */
+export function setWorkspaceLayout(
+    placements: MonitorPlacement[],
+): Promise<void> {
+    return invoke(getType(CommandType, CommandType.SetWorkspaceLayout), {
+        placements: placements.map((p) => ({
+            client_uid: p.client_uid,
+            client_monitor_id: p.client_monitor_id,
+            workspace_x: p.workspace_x,
+            workspace_y: p.workspace_y,
+            width: p.width,
+            height: p.height,
+        })),
+    });
+}
+
 export function saveServerConfig(host: string, port: number, sslEnabled: boolean): Promise<void> {
     return invoke(getType(CommandType, CommandType.SetServerConfig), {host, port, sslEnabled});
 }

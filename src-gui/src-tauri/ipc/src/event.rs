@@ -193,6 +193,7 @@ pub enum CommandType {
     DenyClient,
     ListPendingApprovals,
     SetClientLayout,
+    SetWorkspaceLayout,
 
     // SSL/Certificate management
     EnableSsl,

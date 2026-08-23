@@ -66,6 +66,10 @@ class BusEventType(IntEnum):
     # handlers re-read ``Screen`` directly (``data=None``).
     LOCAL_MONITORS_UPDATED = 13
 
+    # Dispatched on the server when the active client asks to cross an
+    # inter-client edge. The server resolves the destination authoritatively.
+    CLIENT_CROSSING_REQUEST = 14
+
 
 class BusEvent(ABC):
     """Base class for events dispatched on the EventBus."""
@@ -155,12 +159,16 @@ class ClientConnectedEvent(BusEvent):
         streams: Optional[list[int]] = None,
         edge_bindings: Optional[list[dict]] = None,
         intra_client_bindings: Optional[list[dict]] = None,
+        inter_client_bindings: Optional[list[dict]] = None,
     ):
         self.client_uid = client_uid
         self.streams = streams
         self.edge_bindings: list[dict] = list(edge_bindings) if edge_bindings else []
         self.intra_client_bindings: list[dict] = (
             list(intra_client_bindings) if intra_client_bindings else []
+        )
+        self.inter_client_bindings: list[dict] = (
+            list(inter_client_bindings) if inter_client_bindings else []
         )
 
     def to_dict(self) -> dict:
@@ -169,6 +177,7 @@ class ClientConnectedEvent(BusEvent):
             "streams": self.streams,
             "edge_bindings": list(self.edge_bindings),
             "intra_client_bindings": list(self.intra_client_bindings),
+            "inter_client_bindings": list(self.inter_client_bindings),
         }
 
 
@@ -186,11 +195,15 @@ class ClientTopologyUpdatedEvent(BusEvent):
         edge_bindings: Optional[list[dict]] = None,
         server_bbox: Optional[tuple[int, int, int, int]] = None,
         intra_client_bindings: Optional[list[dict]] = None,
+        inter_client_bindings: Optional[list[dict]] = None,
     ):
         self.edge_bindings: list[dict] = list(edge_bindings) if edge_bindings else []
         self.server_bbox = server_bbox
         self.intra_client_bindings: list[dict] = (
             list(intra_client_bindings) if intra_client_bindings else []
+        )
+        self.inter_client_bindings: list[dict] = (
+            list(inter_client_bindings) if inter_client_bindings else []
         )
 
     def to_dict(self) -> dict:
@@ -198,6 +211,7 @@ class ClientTopologyUpdatedEvent(BusEvent):
             "edge_bindings": list(self.edge_bindings),
             "server_bbox": list(self.server_bbox) if self.server_bbox else None,
             "intra_client_bindings": list(self.intra_client_bindings),
+            "inter_client_bindings": list(self.inter_client_bindings),
         }
 
 
@@ -209,11 +223,15 @@ class ClientLayoutUpdatedEvent(BusEvent):
         client_uid: str,
         edge_bindings: Optional[list[dict]] = None,
         intra_client_bindings: Optional[list[dict]] = None,
+        inter_client_bindings: Optional[list[dict]] = None,
     ):
         self.client_uid = client_uid
         self.edge_bindings: list[dict] = list(edge_bindings) if edge_bindings else []
         self.intra_client_bindings: list[dict] = (
             list(intra_client_bindings) if intra_client_bindings else []
+        )
+        self.inter_client_bindings: list[dict] = (
+            list(inter_client_bindings) if inter_client_bindings else []
         )
 
     def to_dict(self) -> dict:
@@ -221,6 +239,31 @@ class ClientLayoutUpdatedEvent(BusEvent):
             "client_uid": self.client_uid,
             "edge_bindings": list(self.edge_bindings),
             "intra_client_bindings": list(self.intra_client_bindings),
+            "inter_client_bindings": list(self.inter_client_bindings),
+        }
+
+
+class ClientCrossingRequestEvent(BusEvent):
+    """Server-side request from a client at one of its inter-client edges."""
+
+    def __init__(
+        self,
+        client_uid: str,
+        source_monitor_id: int,
+        exit_edge: str,
+        axis_position: float,
+    ):
+        self.client_uid = client_uid
+        self.source_monitor_id = source_monitor_id
+        self.exit_edge = exit_edge
+        self.axis_position = axis_position
+
+    def to_dict(self) -> dict:
+        return {
+            "client_uid": self.client_uid,
+            "source_monitor_id": self.source_monitor_id,
+            "exit_edge": self.exit_edge,
+            "axis_position": self.axis_position,
         }
 
 
@@ -361,6 +404,7 @@ class CommandEvent(Event):
     KEYBOARD_STATE_SYNC = "keyboard_state_sync"
     CLIENT_TOPOLOGY = "client_topology"
     CLIENT_MONITORS_UPDATE = "client_monitors_update"
+    CLIENT_CROSSING_REQUEST = "client_crossing_request"
 
     def __init__(
         self,
@@ -456,6 +500,7 @@ class ClientTopologyCommandEvent(CommandEvent):
         edge_bindings: Optional[list[dict]] = None,
         server_bbox: Optional[tuple[int, int, int, int]] = None,
         intra_client_bindings: Optional[list[dict]] = None,
+        inter_client_bindings: Optional[list[dict]] = None,
     ):
         super().__init__(
             command=CommandEvent.CLIENT_TOPOLOGY,
@@ -467,6 +512,9 @@ class ClientTopologyCommandEvent(CommandEvent):
                 "intra_client_bindings": (
                     list(intra_client_bindings) if intra_client_bindings else []
                 ),
+                "inter_client_bindings": (
+                    list(inter_client_bindings) if inter_client_bindings else []
+                ),
             },
         )
 
@@ -475,6 +523,9 @@ class ClientTopologyCommandEvent(CommandEvent):
 
     def get_intra_client_bindings(self) -> list[dict]:
         return list(self.params.get("intra_client_bindings") or [])
+
+    def get_inter_client_bindings(self) -> list[dict]:
+        return list(self.params.get("inter_client_bindings") or [])
 
     def get_server_bbox(self) -> Optional[tuple[int, int, int, int]]:
         raw = self.params.get("server_bbox")
@@ -491,6 +542,7 @@ class ClientTopologyCommandEvent(CommandEvent):
             edge_bindings=event.params.get("edge_bindings") or [],
             server_bbox=tuple(raw_bbox) if raw_bbox and len(raw_bbox) == 4 else None,
             intra_client_bindings=event.params.get("intra_client_bindings") or [],
+            inter_client_bindings=event.params.get("inter_client_bindings") or [],
         )
 
     def to_dict(self) -> dict:
@@ -503,6 +555,52 @@ class ClientTopologyCommandEvent(CommandEvent):
                 "intra_client_bindings": list(
                     self.params.get("intra_client_bindings") or []
                 ),
+                "inter_client_bindings": list(
+                    self.params.get("inter_client_bindings") or []
+                ),
+            },
+        }
+
+
+class ClientCrossingRequestCommandEvent(CommandEvent):
+    """Client-to-server request; the payload deliberately contains no destination."""
+
+    def __init__(
+        self,
+        source: str = "",
+        target: str = "server",
+        source_monitor_id: int = -1,
+        exit_edge: str = "",
+        axis_position: float = -1,
+    ):
+        super().__init__(
+            command=CommandEvent.CLIENT_CROSSING_REQUEST,
+            source=source,
+            target=target,
+            params={
+                "source_monitor_id": source_monitor_id,
+                "exit_edge": exit_edge,
+                "axis_position": axis_position,
+            },
+        )
+
+    @classmethod
+    def from_command_event(cls, event: CommandEvent) -> Self:
+        return cls(
+            source=event.source,
+            target=event.target,
+            source_monitor_id=int(event.params.get("source_monitor_id", -1)),
+            exit_edge=str(event.params.get("exit_edge", "")),
+            axis_position=float(event.params.get("axis_position", -1)),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "command": self.command,
+            "params": {
+                "source_monitor_id": self.params["source_monitor_id"],
+                "exit_edge": self.params["exit_edge"],
+                "axis_position": self.params["axis_position"],
             },
         }
 

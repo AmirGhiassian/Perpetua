@@ -173,6 +173,7 @@ class Server:
         # CLIENT_LAYOUT_UPDATED handlers. Locks are created lazily on first
         # access via ``_lock_for`` and dropped when the client is removed.
         self._client_locks: Dict[str, asyncio.Lock] = {}
+        self._workspace_lock = asyncio.Lock()
 
     @property
     def clients_manager(self) -> ClientsManager:
@@ -637,6 +638,191 @@ class Server:
             screen_position=screen_position,
         )
 
+    def _workspace_placements(
+        self,
+        server_monitors,
+        overrides: Optional[dict[str, list[dict]]] = None,
+        connected_only: bool = False,
+    ) -> list[dict]:
+        """Flatten client placements into the shared workspace model."""
+        out: list[dict] = []
+        overrides = overrides or {}
+        for workspace_client in self.config.get_clients():
+            if connected_only and not workspace_client.is_connected:
+                continue
+            placements = overrides.get(workspace_client.uid)
+            if placements is None:
+                placements = workspace_client.get_effective_placements(server_monitors)
+            for placement in placements or []:
+                item = dict(placement)
+                item["client_uid"] = workspace_client.uid
+                out.append(item)
+        return out
+
+    def _validate_workspace_placements(
+        self,
+        placements: list[dict],
+        server_monitors,
+    ) -> None:
+        """Validate monitor identity, overlap, size, and server reachability."""
+        from utils.screen import connected_placement_indices
+
+        clients = {client.uid: client for client in self.config.get_clients()}
+        normalized_rects: list[dict] = []
+        for placement in placements:
+            uid = str(placement.get("client_uid", ""))
+            client = clients.get(uid)
+            if client is None:
+                raise ValueError(f"Unknown client_uid={uid!r} in workspace layout")
+            try:
+                monitor_id = int(placement["client_monitor_id"])
+                width = int(placement["width"])
+                height = int(placement["height"])
+                x = int(placement["workspace_x"])
+                y = int(placement["workspace_y"])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(f"Malformed workspace placement: {placement!r}")
+            if width <= 0 or height <= 0:
+                raise ValueError(f"Placement has non-positive size: {placement!r}")
+            known_ids = {monitor.monitor_id for monitor in client.monitors or []}
+            if known_ids and monitor_id not in known_ids:
+                raise ValueError(
+                    f"Unknown monitor_id={monitor_id} for client {uid!r}"
+                )
+            normalized_rects.append(
+                {
+                    "client_uid": uid,
+                    "client_monitor_id": monitor_id,
+                    "workspace_x": x,
+                    "workspace_y": y,
+                    "width": width,
+                    "height": height,
+                }
+            )
+
+        def overlaps(a: dict, b: dict) -> bool:
+            return not (
+                a["workspace_x"] + a["width"] <= b["workspace_x"]
+                or b["workspace_x"] + b["width"] <= a["workspace_x"]
+                or a["workspace_y"] + a["height"] <= b["workspace_y"]
+                or b["workspace_y"] + b["height"] <= a["workspace_y"]
+            )
+
+        server_rects = [
+            {
+                "workspace_x": monitor.min_x,
+                "workspace_y": monitor.min_y,
+                "width": monitor.max_x - monitor.min_x,
+                "height": monitor.max_y - monitor.min_y,
+            }
+            for monitor in server_monitors
+        ]
+        for i, placement in enumerate(normalized_rects):
+            if any(overlaps(placement, server_rect) for server_rect in server_rects):
+                raise ValueError(f"Placement {placement} overlaps a server monitor")
+            for other in normalized_rects[i + 1 :]:
+                if overlaps(placement, other):
+                    raise ValueError(
+                        f"Placement {placement} overlaps placement {other}"
+                    )
+
+        connected = connected_placement_indices(normalized_rects, server_monitors)
+        if len(connected) != len(normalized_rects):
+            detached = [
+                normalized_rects[i]
+                for i in range(len(normalized_rects))
+                if i not in connected
+            ]
+            raise ValueError(
+                "Placements are not connected to the server topology: "
+                f"{detached}"
+            )
+
+    def _build_workspace_topology(self, server_monitors) -> dict[str, dict[str, list]]:
+        """Compute complete per-client server, intra-, and inter-client routes."""
+        from utils.screen import compute_inter_client_bindings
+
+        clients = [
+            client for client in self.config.get_clients() if client.is_connected
+        ]
+        placements = self._workspace_placements(
+            server_monitors, connected_only=True
+        )
+        inter_by_uid: dict[str, list[dict]] = {client.uid: [] for client in clients}
+        for binding in compute_inter_client_bindings(placements):
+            inter_by_uid.setdefault(binding.src_client_uid, []).append(
+                binding.to_dict()
+            )
+        return {
+            client.uid: {
+                "edge": [
+                    binding.to_dict()
+                    for binding in client.get_edge_bindings(server_monitors)
+                ],
+                "intra": client.get_intra_client_bindings(server_monitors),
+                "inter": inter_by_uid.get(client.uid, []),
+            }
+            for client in clients
+        }
+
+    async def _refresh_workspace_topology(self, server_monitors=None) -> None:
+        """Recompute and publish routes for every connected client."""
+        if server_monitors is None:
+            from utils.screen import Screen
+
+            try:
+                server_monitors = Screen.get_monitors_cached()
+            except Exception:
+                server_monitors = []
+        topology = self._build_workspace_topology(server_monitors)
+        for uid, routes in topology.items():
+            await self.event_bus.dispatch(
+                event_type=BusEventType.CLIENT_LAYOUT_UPDATED,
+                data=ClientLayoutUpdatedEvent(
+                    client_uid=uid,
+                    edge_bindings=routes["edge"],
+                    intra_client_bindings=routes["intra"],
+                    inter_client_bindings=routes["inter"],
+                ),
+            )
+
+    async def set_workspace_layout(
+        self, placements: list[dict], auto_save: bool = True
+    ) -> list[ClientObj]:
+        """Atomically validate and replace every client's explicit placements."""
+        from utils.screen import Screen
+
+        async with self._workspace_lock:
+            try:
+                server_monitors = Screen.get_monitors_cached()
+            except Exception:
+                server_monitors = []
+            workspace = [dict(placement) for placement in placements or []]
+            self._validate_workspace_placements(workspace, server_monitors)
+            grouped: dict[str, list[dict]] = {
+                client.uid: [] for client in self.config.get_clients()
+            }
+            for placement in workspace:
+                uid = str(placement["client_uid"])
+                grouped[uid].append(
+                    {
+                        "client_monitor_id": int(placement["client_monitor_id"]),
+                        "workspace_x": int(placement["workspace_x"]),
+                        "workspace_y": int(placement["workspace_y"]),
+                        "width": int(placement["width"]),
+                        "height": int(placement["height"]),
+                    }
+                )
+            updated: list[ClientObj] = []
+            for client in self.config.get_clients():
+                client.placements = grouped.get(client.uid, [])
+                self.clients_manager.update_client(client)
+                updated.append(client)
+            if auto_save:
+                await self.save_config()
+            await self._refresh_workspace_topology(server_monitors)
+            return updated
+
     async def set_client_layout(
         self,
         placements: list[dict],
@@ -662,8 +848,11 @@ class Server:
                 f"Client [uid={uid}, ip={ip_address}, host={hostname}] not found"
             )
 
-        async with self._lock_for(client.uid):
-            return await self._set_client_layout_locked(client, placements, auto_save)
+        async with self._workspace_lock:
+            async with self._lock_for(client.uid):
+                return await self._set_client_layout_locked(
+                    client, placements, auto_save
+                )
 
     async def _set_client_layout_locked(
         self, client: ClientObj, placements: list[dict], auto_save: bool
@@ -731,26 +920,6 @@ class Server:
                         f"Placement {p} overlaps server monitor #{m.monitor_id}"
                     )
 
-        # Server-adjacency rule: every client monitor must abut at least
-        # one server monitor on a shared edge. Chained client-only hops
-        # (A↔server, B↔A but B not touching the server) are forbidden
-        # because the cursor's reverse routing has nowhere to land back
-        # to the server when it leaves B's outer edge.
-        if server_monitors and normalized:
-            from utils.screen import compute_edge_bindings
-
-            for p in normalized:
-                try:
-                    bindings = compute_edge_bindings(p, server_monitors)
-                except Exception:
-                    bindings = []
-                if not bindings:
-                    raise ValueError(
-                        f"Placement for client_monitor_id={p['client_monitor_id']} "
-                        f"is not adjacent to any server monitor. Every client "
-                        f"placement must share at least one edge with the server."
-                    )
-
         # Overlap with OTHER clients' placements. Compare on uid (stable identity)
         # rather than net_id (hostname/ip), which collides between distinct clients
         # behind the same NAT or sharing a hostname.
@@ -777,6 +946,12 @@ class Server:
                             f"placement {op_norm}"
                         )
 
+        workspace = self._workspace_placements(
+            server_monitors,
+            overrides={client.uid: normalized},
+        )
+        self._validate_workspace_placements(workspace, server_monitors)
+
         # Commit.
         client.placements = normalized
         self.clients_manager.update_client(client)
@@ -785,18 +960,7 @@ class Server:
 
         # Hot-reload the listener's routing cache so the new placements
         # take effect on the next crossing, without forcing a reconnect.
-        edge_bindings = [
-            eb.to_dict() for eb in client.get_edge_bindings(server_monitors)
-        ]
-        intra_client_bindings = client.get_intra_client_bindings(server_monitors)
-        await self.event_bus.dispatch(
-            event_type=BusEventType.CLIENT_LAYOUT_UPDATED,
-            data=ClientLayoutUpdatedEvent(
-                client_uid=client.uid,
-                edge_bindings=edge_bindings,
-                intra_client_bindings=intra_client_bindings,
-            ),
-        )
+        await self._refresh_workspace_topology(server_monitors)
 
         self._logger.info(
             f"Set layout for client {client.get_net_id()}: "
@@ -832,47 +996,57 @@ class Server:
         server_monitors,
         notify: bool = True,
     ) -> list[dict]:
-        """Drop client placements that no longer touch any server monitor.
+        """Drop whole placement components detached from the server topology."""
+        from utils.screen import connected_placement_indices
 
-        Returns a list of orphan descriptors (one per dropped placement)
-        so the GUI can show the admin which placements went away. When
-        ``notify`` is True the bus is also re-dispatched per affected
-        client so the mouse listener's edge-binding cache stays in sync.
-        """
-        from utils.screen import compute_edge_bindings
+        async with self._workspace_lock:
+            clients = list(self.config.get_clients())
+            workspace: list[dict] = []
+            owners: list[ClientObj] = []
+            for client in clients:
+                for placement in list(client.placements or []):
+                    item = dict(placement)
+                    item["client_uid"] = client.uid
+                    workspace.append(item)
+                    owners.append(client)
 
-        orphans: list[dict] = []
+            connected = connected_placement_indices(workspace, server_monitors)
+            kept_by_uid: dict[str, list[dict]] = {client.uid: [] for client in clients}
+            orphans: list[dict] = []
+            for index, placement in enumerate(workspace):
+                client = owners[index]
+                stored = {
+                    key: value
+                    for key, value in placement.items()
+                    if key != "client_uid"
+                }
+                if index in connected:
+                    kept_by_uid[client.uid].append(stored)
+                else:
+                    orphans.append(
+                        {
+                            "client_uid": client.uid,
+                            "client_net_id": client.get_net_id(),
+                            "placement": stored,
+                        }
+                    )
 
-        # Snapshot the client list once so add/remove churn during iteration
-        # doesn't trip us up. We acquire the per-client lock for each section
-        # (never two at once) to keep set_client_layout / monitor updates
-        # from racing against this reconciliation.
-        for client in list(self.config.get_clients()):
-            try:
-                async with asyncio.timeout(5.0):
-                    async with self._lock_for(client.uid):
-                        await self._reconcile_single_client(
-                            client,
-                            server_monitors,
-                            notify,
-                            orphans,
-                            compute_edge_bindings,
-                        )
-            except asyncio.TimeoutError:
-                self._logger.warning(
-                    f"Reconciliation timeout for client {client.get_net_id()} "
-                    f"(uid={client.uid}); skipping"
-                )
+            for client in clients:
+                kept = kept_by_uid[client.uid]
+                if kept != list(client.placements or []):
+                    client.placements = kept
+                    self.clients_manager.update_client(client)
 
-        if orphans:
-            try:
-                await self.save_config()
-            except Exception as e:
-                self._logger.warning(
-                    "Failed to persist layout reconciliation", error=str(e)
-                )
-
-        return orphans
+            if orphans:
+                try:
+                    await self.save_config()
+                except Exception as e:
+                    self._logger.warning(
+                        "Failed to persist layout reconciliation", error=str(e)
+                    )
+            if notify:
+                await self._refresh_workspace_topology(server_monitors)
+            return orphans
 
     async def _reconcile_single_client(
         self,
@@ -1830,20 +2004,22 @@ class Server:
             server_monitors = Screen.get_monitors_cached()
         except Exception:
             server_monitors = []
-        edge_bindings = [
-            eb.to_dict() for eb in client.get_edge_bindings(server_monitors)
-        ]
-        intra_client_bindings = client.get_intra_client_bindings(server_monitors)
+        topology = self._build_workspace_topology(server_monitors)
+        routes = topology.get(
+            client.uid, {"edge": [], "intra": [], "inter": []}
+        )
 
         await self.event_bus.dispatch(
             event_type=BusEventType.CLIENT_CONNECTED,
             data=ClientConnectedEvent(
                 client_uid=client.uid,
                 streams=streams,
-                edge_bindings=edge_bindings,
-                intra_client_bindings=intra_client_bindings,
+                edge_bindings=routes["edge"],
+                intra_client_bindings=routes["intra"],
+                inter_client_bindings=routes["inter"],
             ),
         )
+        await self._refresh_workspace_topology(server_monitors)
         await self.save_config()
         self._logger.info(f"Client {client.get_net_id()} connected")
 
@@ -1865,6 +2041,7 @@ class Server:
             event_type=BusEventType.CLIENT_DISCONNECTED,
             data=ClientDisconnectedEvent(client_uid=client.uid, streams=streams),
         )
+        await self._refresh_workspace_topology()
         await self.save_config()
         self._logger.info(f"Client {client.get_net_id()} disconnected")
 
@@ -2000,18 +2177,7 @@ class Server:
         except Exception:
             server_monitors = []
         try:
-            edge_bindings = [
-                eb.to_dict() for eb in client.get_edge_bindings(server_monitors)
-            ]
-            intra_client_bindings = client.get_intra_client_bindings(server_monitors)
-            await self.event_bus.dispatch(
-                event_type=BusEventType.CLIENT_LAYOUT_UPDATED,
-                data=ClientLayoutUpdatedEvent(
-                    client_uid=client.uid,
-                    edge_bindings=edge_bindings,
-                    intra_client_bindings=intra_client_bindings,
-                ),
-            )
+            await self._refresh_workspace_topology(server_monitors)
         except Exception as e:
             self._logger.warning(
                 f"Failed to refresh bindings for {client.get_net_id()} "
