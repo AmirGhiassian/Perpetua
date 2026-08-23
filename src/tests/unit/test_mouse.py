@@ -19,8 +19,6 @@ Tests EdgeDetector, ServerMouseListener, ServerMouseController, and ClientMouseC
 #  You should have received a copy of the GNU General Public License
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-from tests.unit import _MOCK_PYNPUT
-
 import asyncio
 import sys
 import time
@@ -29,30 +27,138 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from event import (
-    BusEventType,
-    MouseEvent,
     ActiveScreenChangedEvent,
-    ClientConnectedEvent,
-    ClientDisconnectedEvent,
+    BusEventType,
     ClientActiveEvent,
+    ClientConnectedEvent,
+    ClientCrossingRequestCommandEvent,
+    ClientCrossingRequestEvent,
+    ClientDisconnectedEvent,
     ClientLayoutUpdatedEvent,
+    ClientTopologyCommandEvent,
     CrossScreenCommandEvent,
+    MouseEvent,
 )
-
 from model.client import ScreenPosition
 from network.stream import StreamType
+from tests.unit import _MOCK_PYNPUT
 
 _MOCK_PYNPUT()
 
 from input.mouse._base import (  # noqa: E402
+    ButtonMapping,
+    ClientMouseController,
     EdgeDetector,
     ScreenEdge,
-    ServerMouseListener,
     ServerMouseController,
-    ClientMouseController,
-    ButtonMapping,
+    ServerMouseListener,
 )
 from utils.screen import MonitorLayout  # noqa: E402
+
+
+@pytest.mark.anyio
+class TestInterClientCrossing:
+    async def test_client_submits_source_only_request_and_deactivates(
+        self, event_bus, mock_stream_handler, mock_mouse_controller
+    ):
+        with patch(
+            "input.mouse._base.MouseController", return_value=mock_mouse_controller
+        ):
+            with _ScreenGeometry(1920, 1080):
+                controller = ClientMouseController(
+                    event_bus, mock_stream_handler, mock_stream_handler
+                )
+        controller._is_active = True
+        controller._current_screen = "client-a"
+        monitor = controller._monitor_layout.monitors[0]
+        controller._inter_by_src = {
+            monitor.monitor_id: [
+                {
+                    "src_monitor_id": monitor.monitor_id,
+                    "src_edge": "right",
+                    "src_axis_start": 0.0,
+                    "src_axis_end": 1.0,
+                    "dst_client_uid": "client-b",
+                }
+            ]
+        }
+
+        consumed = await controller._try_inter_client_crossing(
+            ScreenEdge.RIGHT, monitor.max_x - 1, 540, monitor
+        )
+
+        assert consumed is True
+        sent = mock_stream_handler.send.await_args.args[0]
+        assert isinstance(sent, ClientCrossingRequestCommandEvent)
+        assert sent.params["source_monitor_id"] == monitor.monitor_id
+        assert "dst_client_uid" not in sent.params
+        assert controller._is_active is False
+
+    async def test_server_maps_request_and_pushes_destination_topology(
+        self, event_bus, mock_stream_handler
+    ):
+        with _ScreenGeometry(1920, 1080):
+            listener = ServerMouseListener(
+                event_bus,
+                mock_stream_handler,
+                mock_stream_handler,
+                filtering=False,
+            )
+        listener._active_clients = {"client-a": True, "client-b": True}
+        listener._active_clients_snapshot = ("client-a", "client-b")
+        listener._active_client_uid = "client-a"
+        listener._inter_bindings_by_client = {
+            "client-a": [
+                {
+                    "src_client_uid": "client-a",
+                    "src_monitor_id": 1,
+                    "src_edge": "right",
+                    "src_axis_start": 0.25,
+                    "src_axis_end": 0.75,
+                    "dst_client_uid": "client-b",
+                    "dst_monitor_id": 4,
+                    "dst_edge": "left",
+                    "dst_axis_start": 0.0,
+                    "dst_axis_end": 1.0,
+                }
+            ]
+        }
+
+        await listener._on_client_crossing_request(
+            ClientCrossingRequestEvent("client-a", 1, "right", 0.5)
+        )
+
+        sent = [call.args[0] for call in mock_stream_handler.send.await_args_list]
+        assert any(isinstance(item, ClientTopologyCommandEvent) for item in sent)
+        activation = next(
+            item for item in sent if isinstance(item, CrossScreenCommandEvent)
+        )
+        assert activation.target == "client-b"
+        assert activation.get_client_monitor_id() == 4
+        assert activation.get_position() == (0.0, 0.5)
+
+    async def test_server_rejects_spoofed_source_to_safe_fallback(
+        self, event_bus, mock_stream_handler
+    ):
+        with _ScreenGeometry(1920, 1080):
+            listener = ServerMouseListener(
+                event_bus,
+                mock_stream_handler,
+                mock_stream_handler,
+                filtering=False,
+            )
+        listener._active_clients_snapshot = ("client-a", "client-b")
+        listener._active_client_uid = "client-a"
+        event_bus.dispatch = AsyncMock()
+        await listener._on_client_crossing_request(
+            ClientCrossingRequestEvent("client-b", 1, "right", 0.5)
+        )
+        dispatched = [
+            call.kwargs["data"].active_screen
+            for call in event_bus.dispatch.await_args_list
+            if call.kwargs["event_type"] == BusEventType.SCREEN_CHANGE_GUARD
+        ]
+        assert None in dispatched
 
 
 def _patch_screen_geometry(w: int, h: int):

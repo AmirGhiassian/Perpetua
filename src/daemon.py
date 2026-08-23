@@ -21,42 +21,41 @@
 import asyncio
 import datetime
 import errno
-import msgspec
 import os
-import time
-import threading
-
-from os import path
 import signal
 import socket
 import sys
-from typing import Optional, Dict, Any, Callable
+import threading
+import time
 from enum import StrEnum
+from os import path
+from typing import Any, Callable, Dict, Optional
 
-from config import ApplicationConfig, ServerConfig, ClientConfig
+import msgspec
+
+from config import ApplicationConfig, ClientConfig, ServerConfig
+from event.notification import (
+    ErrorEvent,
+    InfoEvent,
+    NotificationEvent,
+    NotificationManager,
+    OtpGeneratedEvent,
+)
 from service.client import Client
 from service.server import Server, ServerStartError
 from utils import BackgroundTasks
-from utils.logging import Logger, get_logger
 from utils.cli import DaemonArguments
+from utils.logging import Logger, get_logger
 from utils.permissions import PermissionChecker
 from utils.permissions._base import PermissionResult, PermissionStatus, PermissionType
 from utils.runtime import (
-    env_endpoint_override,
     endpoint_to_socket_path,
+    env_endpoint_override,
     format_tcp_endpoint,
     format_unix_endpoint,
     remove_endpoint,
     write_endpoint,
 )
-from event.notification import (
-    NotificationManager,
-    NotificationEvent,
-    OtpGeneratedEvent,
-    InfoEvent,
-    ErrorEvent,
-)
-
 
 IS_WINDOWS = sys.platform in ("win32", "cygwin")
 

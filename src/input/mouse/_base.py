@@ -17,38 +17,36 @@
 
 import asyncio
 from collections import deque
-from typing import Optional
-from time import time
 from threading import Lock
+from time import time
+from typing import Optional
 
 from event import (
-    BusEventType,
-    MouseEvent,
-    EventMapper,
-    ClientTopologyCommandEvent,
-    ClientTopologyUpdatedEvent,
-    CrossScreenCommandEvent,
-    ForceScreenChangeCommandEvent,
     ActiveScreenChangedEvent,
+    BusEventType,
+    ClientActiveEvent,
     ClientConnectedEvent,
     ClientCrossingRequestCommandEvent,
     ClientCrossingRequestEvent,
     ClientDisconnectedEvent,
-    ClientActiveEvent,
     ClientLayoutUpdatedEvent,
-    ScreenSwitchDirectionalRequestEvent,
+    ClientTopologyCommandEvent,
+    ClientTopologyUpdatedEvent,
+    CrossScreenCommandEvent,
+    EventMapper,
+    ForceScreenChangeCommandEvent,
+    MouseEvent,
     ScreenSwitchCycleRequestEvent,
+    ScreenSwitchDirectionalRequestEvent,
 )
 from event.bus import EventBus
-
+from input.utils import ButtonMapping, EdgeDetector, ScreenEdge
 from network.stream import StreamType
 from network.stream.handler import StreamHandler
-
 from utils.logging import get_logger
 from utils.screen import Screen
-from input.utils import ScreenEdge, EdgeDetector, ButtonMapping
 
-from .backend import MouseListener, MouseController, Button, BACKEND
+from .backend import BACKEND, Button, MouseController, MouseListener
 
 
 class ServerMouseListener(object):
@@ -468,7 +466,9 @@ class ServerMouseListener(object):
             or data.exit_edge not in {"left", "right", "top", "bottom"}
             or not 0.0 <= data.axis_position <= 1.0
         ):
-            await self._return_failed_crossing_to_server(source_uid)
+            await self._return_failed_crossing_to_server(
+                self._active_client_uid or ""
+            )
             return
 
         binding = next(

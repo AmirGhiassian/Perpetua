@@ -15,8 +15,9 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 
-from utils import backend_module
 from typing import TYPE_CHECKING
+
+from utils import backend_module
 
 from ._monitor import (
     Edge,

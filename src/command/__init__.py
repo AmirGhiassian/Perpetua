@@ -19,23 +19,23 @@
 #
 
 from event import (
-    BusEventType,
-    CommandEvent,
-    EventMapper,
     ActiveScreenChangedEvent,
+    BusEventType,
+    ClientActiveEvent,
+    ClientCrossingRequestCommandEvent,
+    ClientCrossingRequestEvent,
     ClientMonitorsUpdateCommandEvent,
     ClientMonitorsUpdatedEvent,
     ClientTopologyCommandEvent,
     ClientTopologyUpdatedEvent,
+    CommandEvent,
     CrossScreenCommandEvent,
-    ClientActiveEvent,
-    ClientCrossingRequestCommandEvent,
-    ClientCrossingRequestEvent,
+    EventMapper,
     ForceScreenChangeCommandEvent,
 )
 from event.bus import EventBus
-from network.stream.handler import StreamHandler
 from network.protocol.message import MessageType
+from network.stream.handler import StreamHandler
 from utils.logging import get_logger
 
 

@@ -21,26 +21,10 @@
 import asyncio
 import socket
 import sys
+from typing import Awaitable, Callable, Dict, Optional, Tuple
 
-from typing import Optional, Dict, Tuple, Callable, Awaitable
-
+from command import CommandHandler
 from config import ApplicationConfig, ServerConfig
-from model.client import ClientObj, ClientsManager
-from event.bus import AsyncEventBus
-from event.notification import (
-    NotificationEvent,
-    ClientApprovalRequestedEvent,
-    ClientApprovalResolvedEvent,
-    ClientRejectedEvent,
-    ClientConnectedEvent as ClientConnectedNotification,
-    ClientDisconnectedEvent as ClientDisconnectedNotification,
-    ConfigSavedEvent,
-    MonitorTopologyChangedEvent,
-    OtpGeneratedEvent,
-    PairingRequestEvent,
-    StreamEnabledEvent,
-    StreamDisabledEvent,
-)
 from event import (
     ActiveScreenChangedEvent,
     BusEventType,
@@ -50,30 +34,44 @@ from event import (
     ClientMonitorsUpdatedEvent,
     ClientStreamReconnectedEvent,
 )
-
-from network.connection.server import ConnectionHandler
-from network.stream.handler.server import (
-    UnidirectionalStreamHandler,
-    BidirectionalStreamHandler,
-    MulticastStreamHandler,
+from event.bus import AsyncEventBus
+from event.notification import (
+    ClientApprovalRequestedEvent,
+    ClientApprovalResolvedEvent,
+    ClientRejectedEvent,
+    ConfigSavedEvent,
+    MonitorTopologyChangedEvent,
+    NotificationEvent,
+    OtpGeneratedEvent,
+    PairingRequestEvent,
+    StreamDisabledEvent,
+    StreamEnabledEvent,
 )
+from event.notification import (
+    ClientConnectedEvent as ClientConnectedNotification,
+)
+from event.notification import (
+    ClientDisconnectedEvent as ClientDisconnectedNotification,
+)
+from input.clipboard import ClipboardController, ClipboardListener
+from input.cursor import CursorHandlerWorker
+from input.keyboard import ServerKeyboardListener
+from input.mouse import ServerMouseController, ServerMouseListener
+from model.client import ClientObj, ClientsManager
+from network.connection.server import ConnectionHandler
 from network.stream import StreamType
 from network.stream.handler import StreamHandler
-
-from command import CommandHandler
-
-from input.cursor import CursorHandlerWorker
-from input.mouse import ServerMouseListener, ServerMouseController
-from input.keyboard import ServerKeyboardListener
-from input.clipboard import ClipboardListener, ClipboardController
-
+from network.stream.handler.server import (
+    BidirectionalStreamHandler,
+    MulticastStreamHandler,
+    UnidirectionalStreamHandler,
+)
 from utils import BackgroundTasks, UIDGenerator
-from utils.metrics import PerformanceMonitor
-from utils.net import MissingIpError, get_local_ip, invalidate_local_ip_cache
 from utils.crypto import CertificateManager
 from utils.crypto.sharing import CertificateSharing
-
 from utils.logging import get_logger
+from utils.metrics import PerformanceMonitor
+from utils.net import MissingIpError, get_local_ip, invalidate_local_ip_cache
 
 from . import ServiceDiscovery
 
@@ -686,9 +684,7 @@ class Server:
                 raise ValueError(f"Placement has non-positive size: {placement!r}")
             known_ids = {monitor.monitor_id for monitor in client.monitors or []}
             if known_ids and monitor_id not in known_ids:
-                raise ValueError(
-                    f"Unknown monitor_id={monitor_id} for client {uid!r}"
-                )
+                raise ValueError(f"Unknown monitor_id={monitor_id} for client {uid!r}")
             normalized_rects.append(
                 {
                     "client_uid": uid,
@@ -734,20 +730,15 @@ class Server:
                 if i not in connected
             ]
             raise ValueError(
-                "Placements are not connected to the server topology: "
-                f"{detached}"
+                f"Placements are not connected to the server topology: {detached}"
             )
 
     def _build_workspace_topology(self, server_monitors) -> dict[str, dict[str, list]]:
         """Compute complete per-client server, intra-, and inter-client routes."""
         from utils.screen import compute_inter_client_bindings
 
-        clients = [
-            client for client in self.config.get_clients() if client.is_connected
-        ]
-        placements = self._workspace_placements(
-            server_monitors, connected_only=True
-        )
+        clients = list(self.config.get_clients())
+        placements = self._workspace_placements(server_monitors, connected_only=True)
         inter_by_uid: dict[str, list[dict]] = {client.uid: [] for client in clients}
         for binding in compute_inter_client_bindings(placements):
             inter_by_uid.setdefault(binding.src_client_uid, []).append(
@@ -2005,9 +1996,7 @@ class Server:
         except Exception:
             server_monitors = []
         topology = self._build_workspace_topology(server_monitors)
-        routes = topology.get(
-            client.uid, {"edge": [], "intra": [], "inter": []}
-        )
+        routes = topology.get(client.uid, {"edge": [], "intra": [], "inter": []})
 
         await self.event_bus.dispatch(
             event_type=BusEventType.CLIENT_CONNECTED,

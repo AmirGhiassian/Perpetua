@@ -18,9 +18,9 @@
 from abc import ABC
 from enum import IntEnum
 from time import time
-from typing import Optional, Self, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Self
 
-from network.protocol.message import ProtocolMessage, MessageType
+from network.protocol.message import MessageType, ProtocolMessage
 
 if TYPE_CHECKING:
     # Keep ``ScreenEdge`` out of the runtime import graph to preserve

@@ -27,16 +27,17 @@ import pytest
 
 from command import CommandHandler
 from event import (
-    BusEventType,
-    CommandEvent,
     ActiveScreenChangedEvent,
-    CrossScreenCommandEvent,
+    BusEventType,
     ClientActiveEvent,
+    ClientCrossingRequestCommandEvent,
+    ClientCrossingRequestEvent,
+    CommandEvent,
+    CrossScreenCommandEvent,
 )
-from network.stream.handler import StreamHandler
 from network.protocol.message import MessageType
+from network.stream.handler import StreamHandler
 from tests.unit.conftest import create_protocol_message
-
 
 # ============================================================================
 # Fixtures
@@ -158,6 +159,29 @@ class TestHandleCommand:
             # Should log warning
             mock_warning.assert_called()
             assert "Unknown command" in str(mock_warning.call_args)
+
+    async def test_handle_client_crossing_request(
+        self, command_handler, mock_event_bus
+    ):
+        message = create_protocol_message(
+            message_type=MessageType.COMMAND,
+            source="client1",
+            target="server",
+            payload=ClientCrossingRequestCommandEvent(
+                source_monitor_id=7,
+                exit_edge="right",
+                axis_position=0.25,
+            ).to_dict(),
+        )
+        await command_handler.handle_command(message)
+        call = mock_event_bus.dispatch.call_args
+        assert call.kwargs["event_type"] == BusEventType.CLIENT_CROSSING_REQUEST
+        request = call.kwargs["data"]
+        assert isinstance(request, ClientCrossingRequestEvent)
+        assert request.client_uid == "client1"
+        assert request.source_monitor_id == 7
+        assert request.exit_edge == "right"
+        assert request.axis_position == 0.25
 
     async def test_handle_command_with_non_command_event(self, command_handler):
         """Test handling non-command event message."""

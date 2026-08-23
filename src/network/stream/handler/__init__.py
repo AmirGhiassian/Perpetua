@@ -19,15 +19,15 @@ import asyncio
 from typing import Any, Optional
 
 from event import (
-    BusEventType,
     ActiveScreenChangedEvent,
-    ClientStreamReconnectedEvent,
-    ClientDisconnectedEvent,
-    ClientConnectedEvent,
+    BusEventType,
     ClientActiveEvent,
+    ClientConnectedEvent,
+    ClientDisconnectedEvent,
+    ClientStreamReconnectedEvent,
 )
 from event.bus import EventBus
-from model.client import ClientsManager, ClientObj
+from model.client import ClientObj, ClientsManager
 from network.data import MissingTransportError
 from network.data.exchange import MessageExchange, MessageExchangeConfig
 from utils.logging import get_logger

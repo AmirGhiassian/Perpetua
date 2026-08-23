@@ -431,9 +431,7 @@ class InterClientBinding:
         if span <= 0:
             return self.dst_axis_start
         local = max(0.0, min(1.0, (axis_norm - self.src_axis_start) / span))
-        return self.dst_axis_start + local * (
-            self.dst_axis_end - self.dst_axis_start
-        )
+        return self.dst_axis_start + local * (self.dst_axis_end - self.dst_axis_start)
 
     def to_dict(self) -> dict:
         return {
@@ -492,13 +490,21 @@ def _ordered_rect_abutments(p: dict, q: dict) -> list[dict]:
         )
 
     if abs((px + pw) - qx) <= _ABUTMENT_TOLERANCE_PX:
-        append(Edge.RIGHT, Edge.LEFT, max(py, qy), min(py + ph, qy + qh), py, ph, qy, qh)
+        append(
+            Edge.RIGHT, Edge.LEFT, max(py, qy), min(py + ph, qy + qh), py, ph, qy, qh
+        )
     if abs(px - (qx + qw)) <= _ABUTMENT_TOLERANCE_PX:
-        append(Edge.LEFT, Edge.RIGHT, max(py, qy), min(py + ph, qy + qh), py, ph, qy, qh)
+        append(
+            Edge.LEFT, Edge.RIGHT, max(py, qy), min(py + ph, qy + qh), py, ph, qy, qh
+        )
     if abs((py + ph) - qy) <= _ABUTMENT_TOLERANCE_PX:
-        append(Edge.BOTTOM, Edge.TOP, max(px, qx), min(px + pw, qx + qw), px, pw, qx, qw)
+        append(
+            Edge.BOTTOM, Edge.TOP, max(px, qx), min(px + pw, qx + qw), px, pw, qx, qw
+        )
     if abs(py - (qy + qh)) <= _ABUTMENT_TOLERANCE_PX:
-        append(Edge.TOP, Edge.BOTTOM, max(px, qx), min(px + pw, qx + qw), px, pw, qx, qw)
+        append(
+            Edge.TOP, Edge.BOTTOM, max(px, qx), min(px + pw, qx + qw), px, pw, qx, qw
+        )
     return out
 
 
@@ -553,7 +559,8 @@ def connected_placement_indices(
         return set(range(len(placements)))
 
     connected = {
-        i for i, placement in enumerate(placements)
+        i
+        for i, placement in enumerate(placements)
         if compute_edge_bindings(placement, server_monitors)
     }
     changed = True
@@ -563,8 +570,7 @@ def connected_placement_indices(
             if i in connected:
                 continue
             if any(
-                _ordered_rect_abutments(placement, placements[j])
-                for j in connected
+                _ordered_rect_abutments(placement, placements[j]) for j in connected
             ):
                 connected.add(i)
                 changed = True
@@ -740,14 +746,8 @@ def compute_intra_client_bindings(
     out: list[dict] = []
     for p in placements:
         try:
-            px = int(p["workspace_x"])
-            py = int(p["workspace_y"])
-            pw = int(p["width"])
-            ph = int(p["height"])
             p_id = int(p["client_monitor_id"])
         except (KeyError, TypeError, ValueError):
-            continue
-        if pw <= 0 or ph <= 0:
             continue
         for q in placements:
             try:

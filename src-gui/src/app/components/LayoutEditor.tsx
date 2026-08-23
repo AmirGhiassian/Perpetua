@@ -530,7 +530,11 @@ export function LayoutEditor({
                 obstacles,
                 ATTACH_THRESHOLD_PX / metrics.scale,
             );
-            nextRect = resolveCollision(snapped, nextRect, obstacles);
+            nextRect = resolveCollision(
+                {...nextRect, ...snapped},
+                nextRect,
+                obstacles,
+            );
         }
         if (!nextAttachment && suppressAttachmentUntilTouch) {
             const touched = findClosestServerAttachment(
@@ -667,11 +671,14 @@ export function LayoutEditor({
             }
             const obstacles = movementObstacles();
             if (!attachment) {
-                chosen = snapRect(
-                    chosen,
-                    obstacles,
-                    ATTACH_THRESHOLD_PX / metrics.scale,
-                );
+                chosen = {
+                    ...chosen,
+                    ...snapRect(
+                        chosen,
+                        obstacles,
+                        ATTACH_THRESHOLD_PX / metrics.scale,
+                    ),
+                };
             }
             chosen = resolveInitialOverlap(chosen, obstacles);
 
