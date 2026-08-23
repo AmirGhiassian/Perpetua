@@ -26,6 +26,7 @@ import {
     canvasToWorkspace,
     computeViewMetrics,
     monitorAsRect,
+    snapRect,
     validatePlacements,
     workspaceBounds,
     workspaceToCanvas,
@@ -150,7 +151,7 @@ export function LayoutEditor({
 
     const validationSummary = useMemo(() => {
         const overlapCount = validation.overlappingIndices.size;
-        const detachedCount = validation.notAdjacentToServerIndices.size;
+        const detachedCount = validation.notConnectedToServerIndices.size;
 
         if (overlapCount > 0 && detachedCount === 0) {
             return `${overlapCount} overlap${overlapCount === 1 ? "" : "s"}`;
@@ -160,7 +161,7 @@ export function LayoutEditor({
         }
         const total = overlapCount + detachedCount;
         return `${total} layout issue${total === 1 ? "" : "s"}`;
-    }, [validation.overlappingIndices, validation.notAdjacentToServerIndices]);
+    }, [validation.overlappingIndices, validation.notConnectedToServerIndices]);
 
     useEffect(() => {
         onValidityChange?.(validation.ok, validation.errors);
@@ -523,6 +524,18 @@ export function LayoutEditor({
         }
 
         nextRect = resolveCollision(nextRect, drag.lastRect, obstacles);
+        if (!nextAttachment) {
+            const snapped = snapRect(
+                nextRect,
+                obstacles,
+                ATTACH_THRESHOLD_PX / metrics.scale,
+            );
+            nextRect = resolveCollision(
+                {...nextRect, ...snapped},
+                nextRect,
+                obstacles,
+            );
+        }
         if (!nextAttachment && suppressAttachmentUntilTouch) {
             const touched = findClosestServerAttachment(
                 nextRect,
@@ -656,7 +669,18 @@ export function LayoutEditor({
                     chosen = projectToAttachment(cursorRect, serverRect, attachment.edge);
                 }
             }
-            chosen = resolveInitialOverlap(chosen, movementObstacles());
+            const obstacles = movementObstacles();
+            if (!attachment) {
+                chosen = {
+                    ...chosen,
+                    ...snapRect(
+                        chosen,
+                        obstacles,
+                        ATTACH_THRESHOLD_PX / metrics.scale,
+                    ),
+                };
+            }
+            chosen = resolveInitialOverlap(chosen, obstacles);
 
             const newPlacement: MonitorPlacement = {
                 client_uid: prev.clientUid,

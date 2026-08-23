@@ -17,36 +17,36 @@
 
 import asyncio
 from collections import deque
-from typing import Optional
-from time import time
 from threading import Lock
+from time import time
+from typing import Optional
 
 from event import (
+    ActiveScreenChangedEvent,
     BusEventType,
-    MouseEvent,
-    EventMapper,
+    ClientActiveEvent,
+    ClientConnectedEvent,
+    ClientCrossingRequestCommandEvent,
+    ClientCrossingRequestEvent,
+    ClientDisconnectedEvent,
+    ClientLayoutUpdatedEvent,
     ClientTopologyCommandEvent,
     ClientTopologyUpdatedEvent,
     CrossScreenCommandEvent,
+    EventMapper,
     ForceScreenChangeCommandEvent,
-    ActiveScreenChangedEvent,
-    ClientConnectedEvent,
-    ClientDisconnectedEvent,
-    ClientActiveEvent,
-    ClientLayoutUpdatedEvent,
-    ScreenSwitchDirectionalRequestEvent,
+    MouseEvent,
     ScreenSwitchCycleRequestEvent,
+    ScreenSwitchDirectionalRequestEvent,
 )
 from event.bus import EventBus
-
+from input.utils import ButtonMapping, EdgeDetector, ScreenEdge
 from network.stream import StreamType
 from network.stream.handler import StreamHandler
-
 from utils.logging import get_logger
 from utils.screen import Screen
-from input.utils import ScreenEdge, EdgeDetector, ButtonMapping
 
-from .backend import MouseListener, MouseController, Button, BACKEND
+from .backend import BACKEND, Button, MouseController, MouseListener
 
 
 class ServerMouseListener(object):
@@ -80,6 +80,7 @@ class ServerMouseListener(object):
         # against the same data.
         self._edge_bindings_by_client: dict[str, list[dict]] = {}
         self._intra_bindings_by_client: dict[str, list[dict]] = {}
+        self._inter_bindings_by_client: dict[str, list[dict]] = {}
 
         # Copy-on-write snapshots consumed by the pynput-thread hot path
         # (on_move -> _resolve_cross_screen_target) without locking. Writers
@@ -200,6 +201,11 @@ class ServerMouseListener(object):
         self.event_bus.subscribe(
             event_type=BusEventType.LOCAL_MONITORS_UPDATED,
             callback=self._on_local_monitors_updated,
+            priority=True,
+        )
+        self.event_bus.subscribe(
+            event_type=BusEventType.CLIENT_CROSSING_REQUEST,
+            callback=self._on_client_crossing_request,
             priority=True,
         )
 
@@ -323,6 +329,9 @@ class ServerMouseListener(object):
                 self._intra_bindings_by_client[client_uid] = list(
                     getattr(data, "intra_client_bindings", []) or []
                 )
+                self._inter_bindings_by_client[client_uid] = list(
+                    getattr(data, "inter_client_bindings", []) or []
+                )
                 self._rebuild_snapshots()
 
         await asyncio.sleep(0)
@@ -337,6 +346,11 @@ class ServerMouseListener(object):
                 del self._active_clients[client_uid]
             self._edge_bindings_by_client.pop(client_uid, None)
             self._intra_bindings_by_client.pop(client_uid, None)
+            self._inter_bindings_by_client.pop(client_uid, None)
+            for source_uid, bindings in self._inter_bindings_by_client.items():
+                self._inter_bindings_by_client[source_uid] = [
+                    b for b in bindings if b.get("dst_client_uid") != client_uid
+                ]
             self._rebuild_snapshots()
 
             if not self._active_clients:
@@ -360,6 +374,9 @@ class ServerMouseListener(object):
                 self._intra_bindings_by_client[data.client_uid] = list(
                     getattr(data, "intra_client_bindings", []) or []
                 )
+                self._inter_bindings_by_client[data.client_uid] = list(
+                    getattr(data, "inter_client_bindings", []) or []
+                )
                 self._rebuild_snapshots()
 
         # Stranded-active recovery: if the client the cursor is CURRENTLY
@@ -369,8 +386,10 @@ class ServerMouseListener(object):
         # stay pinned on a screen that no longer routes back. Force
         # control back to the server, reusing the same primitive as the
         # disconnect path. Done outside the write lock (dispatch awaits).
-        if data.client_uid == self._active_client_uid and not (
-            data.edge_bindings or []
+        if (
+            data.client_uid == self._active_client_uid
+            and not (data.edge_bindings or [])
+            and not (getattr(data, "inter_client_bindings", []) or [])
         ):
             self._logger.info(
                 "active client lost all edge bindings; returning to server",
@@ -403,6 +422,9 @@ class ServerMouseListener(object):
                         intra_client_bindings=list(
                             getattr(data, "intra_client_bindings", []) or []
                         ),
+                        inter_client_bindings=list(
+                            getattr(data, "inter_client_bindings", []) or []
+                        ),
                     )
                 )
             except Exception as e:
@@ -412,6 +434,115 @@ class ServerMouseListener(object):
                     error=str(e),
                 )
         await asyncio.sleep(0)
+
+    async def _return_failed_crossing_to_server(self, client_uid: str) -> None:
+        """Restore server ownership after a stale, spoofed, or unavailable route."""
+        await self.event_bus.dispatch(
+            event_type=BusEventType.SCREEN_CHANGE_GUARD,
+            data=ActiveScreenChangedEvent(active_screen=None),
+        )
+        try:
+            await self.command_stream.send(
+                ForceScreenChangeCommandEvent(target=client_uid)
+            )
+        except Exception as e:
+            self._logger.warning(
+                "failed to deactivate client after rejected crossing",
+                client_uid=client_uid,
+                error=str(e),
+            )
+
+    async def _on_client_crossing_request(
+        self, data: Optional[ClientCrossingRequestEvent]
+    ) -> None:
+        """Resolve and execute a client-to-client crossing on the server."""
+        if data is None:
+            return
+        source_uid = data.client_uid
+        if (
+            not source_uid
+            or source_uid != self._active_client_uid
+            or source_uid not in self._active_clients_snapshot
+            or data.exit_edge not in {"left", "right", "top", "bottom"}
+            or not 0.0 <= data.axis_position <= 1.0
+        ):
+            await self._return_failed_crossing_to_server(self._active_client_uid or "")
+            return
+
+        binding = next(
+            (
+                b
+                for b in self._inter_bindings_by_client.get(source_uid, [])
+                if int(b.get("src_monitor_id", -1)) == data.source_monitor_id
+                and b.get("src_edge") == data.exit_edge
+                and float(b.get("src_axis_start", 0.0))
+                <= data.axis_position
+                < float(b.get("src_axis_end", 0.0))
+            ),
+            None,
+        )
+        destination_uid = binding.get("dst_client_uid") if binding else None
+        if not binding or destination_uid not in self._active_clients_snapshot:
+            await self._return_failed_crossing_to_server(source_uid)
+            return
+
+        try:
+            src_start = float(binding["src_axis_start"])
+            src_end = float(binding["src_axis_end"])
+            dst_start = float(binding["dst_axis_start"])
+            dst_end = float(binding["dst_axis_end"])
+            local = (data.axis_position - src_start) / (src_end - src_start)
+            local = max(0.0, min(1.0, local))
+            dst_axis = dst_start + local * (dst_end - dst_start)
+            dst_edge = str(binding["dst_edge"])
+            if dst_edge == "left":
+                position = (0.0, dst_axis)
+            elif dst_edge == "right":
+                position = (1.0, dst_axis)
+            elif dst_edge == "top":
+                position = (dst_axis, 0.0)
+            elif dst_edge == "bottom":
+                position = (dst_axis, 1.0)
+            else:
+                raise ValueError("invalid destination edge")
+
+            async with self._cross_screen_lock:
+                await self.event_bus.dispatch(
+                    event_type=BusEventType.SCREEN_CHANGE_GUARD,
+                    data=ActiveScreenChangedEvent(active_screen=destination_uid),
+                )
+                await self.command_stream.send(
+                    ClientTopologyCommandEvent(
+                        target=destination_uid,
+                        edge_bindings=self._edge_bindings_by_client.get(
+                            destination_uid, []
+                        ),
+                        server_bbox=self._screen_bbox,
+                        intra_client_bindings=self._intra_bindings_by_client.get(
+                            destination_uid, []
+                        ),
+                        inter_client_bindings=self._inter_bindings_by_client.get(
+                            destination_uid, []
+                        ),
+                    )
+                )
+                await self.command_stream.send(
+                    CrossScreenCommandEvent(
+                        target=destination_uid,
+                        client_monitor_id=int(binding["dst_monitor_id"]),
+                        x=position[0],
+                        y=position[1],
+                        entry_edge=dst_edge,
+                    )
+                )
+        except Exception as e:
+            self._logger.warning(
+                "inter-client crossing failed",
+                source_uid=source_uid,
+                destination_uid=destination_uid,
+                error=str(e),
+            )
+            await self._return_failed_crossing_to_server(source_uid)
 
     async def _on_hotkey_directional(
         self, data: Optional[ScreenSwitchDirectionalRequestEvent]
@@ -864,13 +995,15 @@ class ServerMouseListener(object):
                 # workspace topology over its OS-level monitor adjacency.
                 bindings = self._edge_bindings_by_client.get(screen) or []
                 intra_bindings = self._intra_bindings_by_client.get(screen) or []
-                if bindings or intra_bindings:
+                inter_bindings = self._inter_bindings_by_client.get(screen) or []
+                if bindings or intra_bindings or inter_bindings:
                     await self.command_stream.send(
                         ClientTopologyCommandEvent(
                             target=screen,
                             edge_bindings=bindings,
                             server_bbox=self._screen_bbox,
                             intra_client_bindings=intra_bindings,
+                            inter_client_bindings=inter_bindings,
                         )
                     )
 
@@ -1096,10 +1229,12 @@ class ClientMouseController(object):
         # an unbound OS-driven drift is reverted; a bound transition
         # is honoured via explicit warp.
         self._intra_client_bindings: list[dict] = []
+        self._inter_client_bindings: list[dict] = []
         # O(1) lookups derived from ``_intra_client_bindings``.
         # Rebuilt only when the server pushes a topology.
         self._intra_by_src: dict[int, list[dict]] = {}
         self._intra_pairs: set[tuple[int, int]] = set()
+        self._inter_by_src: dict[int, list[dict]] = {}
         # Monitor last observed under the cursor - used to detect
         # OS-driven drift between client monitors.
         self._last_known_monitor_id: Optional[int] = None
@@ -1527,6 +1662,9 @@ class ClientMouseController(object):
         self._intra_client_bindings = list(
             getattr(data, "intra_client_bindings", []) or []
         )
+        self._inter_client_bindings = list(
+            getattr(data, "inter_client_bindings", []) or []
+        )
         # Pre-build O(1) lookups for the hot path.
         by_src: dict[int, list[dict]] = {}
         pairs: set[tuple[int, int]] = set()
@@ -1539,6 +1677,13 @@ class ClientMouseController(object):
             pairs.add((int(src_id), int(dst_id)))
         self._intra_by_src = by_src
         self._intra_pairs = pairs
+        inter_by_src: dict[int, list[dict]] = {}
+        for binding in self._inter_client_bindings:
+            src_id = binding.get("src_monitor_id")
+            if src_id is None:
+                continue
+            inter_by_src.setdefault(int(src_id), []).append(binding)
+        self._inter_by_src = inter_by_src
         if data.server_bbox:
             try:
                 self._server_bbox = (
@@ -1755,6 +1900,72 @@ class ClientMouseController(object):
     ) -> bool:
         """True iff the workspace authorises a ``src -> dst`` cross-monitor transition."""
         return (src_monitor_id, dst_monitor_id) in self._intra_pairs
+
+    def _resolve_inter_client_crossing(
+        self,
+        edge: ScreenEdge,
+        x: float,
+        y: float,
+        monitor,
+    ) -> Optional[float]:
+        """Return the normalized source-axis position for an advertised route."""
+        if monitor is None:
+            return None
+        edge_str = self._EDGE_TO_STRING_CLIENT.get(edge)
+        if edge_str is None:
+            return None
+        width = max(1, monitor.max_x - monitor.min_x)
+        height = max(1, monitor.max_y - monitor.min_y)
+        axis = (
+            (y - monitor.min_y) / height
+            if edge in (ScreenEdge.LEFT, ScreenEdge.RIGHT)
+            else (x - monitor.min_x) / width
+        )
+        axis = max(0.0, min(1.0, axis))
+        for binding in self._inter_by_src.get(monitor.monitor_id, []):
+            if binding.get("src_edge") != edge_str:
+                continue
+            start = float(binding.get("src_axis_start", 0.0))
+            end = float(binding.get("src_axis_end", 0.0))
+            if start <= axis < end:
+                return axis
+        return None
+
+    async def _try_inter_client_crossing(
+        self,
+        edge: ScreenEdge,
+        x: float,
+        y: float,
+        monitor,
+    ) -> bool:
+        """Submit a source-only crossing request and immediately deactivate."""
+        axis = self._resolve_inter_client_crossing(edge, x, y, monitor)
+        if axis is None or monitor is None or not self._current_screen:
+            return False
+        self._cross_screen_event.set()
+        self._movement_history.clear()
+        try:
+            await self.command_stream.send(
+                ClientCrossingRequestCommandEvent(
+                    source=self._current_screen,
+                    source_monitor_id=monitor.monitor_id,
+                    exit_edge=self._EDGE_TO_STRING_CLIENT[edge],
+                    axis_position=axis,
+                )
+            )
+        except Exception as e:
+            self._logger.warning(
+                "failed to submit inter-client crossing; returning to server",
+                error=str(e),
+            )
+            await self._force_return_to_server()
+            return True
+        self._is_active = False
+        await self.event_bus.dispatch(
+            event_type=BusEventType.CLIENT_INACTIVE,
+            data=None,
+        )
+        return True
 
     @staticmethod
     def _infer_exit_edge(previous, x: float, y: float) -> Optional[ScreenEdge]:
@@ -1998,6 +2209,11 @@ class ClientMouseController(object):
                 if self._try_intra_client_warp_sync(edge, x, y, current_monitor):
                     return None
 
+                if entry_gate_open and await self._try_inter_client_crossing(
+                    edge, x, y, current_monitor
+                ):
+                    return await asyncio.sleep(0)
+
                 if current_monitor is not None:
                     self._clamp_cursor_to_monitor(current_monitor)
                     self._movement_history.clear()
@@ -2076,6 +2292,10 @@ class ClientMouseController(object):
                 edge=str(exit_edge),
             )
             if self._try_intra_client_warp_sync(exit_edge, edge_x, edge_y, previous):
+                return True
+            if await self._try_inter_client_crossing(
+                exit_edge, edge_x, edge_y, previous
+            ):
                 return True
 
         self._clamp_cursor_to_monitor(previous)

@@ -21,6 +21,7 @@ import pytest
 from utils.screen import (
     Edge,
     EdgeBinding,
+    InterClientBinding,
     LayoutBinding,
     LayoutReconciliation,
     LayoutSlot,
@@ -28,7 +29,9 @@ from utils.screen import (
     MonitorInfo,
     MonitorLayout,
     compute_edge_bindings,
+    compute_inter_client_bindings,
     compute_intra_client_bindings,
+    connected_placement_indices,
     reconcile_bindings_with_client_monitors,
 )
 
@@ -776,3 +779,43 @@ class TestComputeIntraClientBindings:
         assert any(
             b["src_monitor_id"] == 0 and b["src_edge"] == "bottom" for b in bindings
         )
+
+
+class TestInterClientBindings:
+    @staticmethod
+    def _placement(uid: str, monitor_id: int, x: int, y: int, w: int, h: int):
+        return {
+            "client_uid": uid,
+            "client_monitor_id": monitor_id,
+            "workspace_x": x,
+            "workspace_y": y,
+            "width": w,
+            "height": h,
+        }
+
+    def test_ordered_bindings_map_asymmetric_partial_overlap(self):
+        placements = [
+            self._placement("a", 1, 1920, 0, 1280, 1080),
+            self._placement("b", 4, 3200, 180, 1920, 720),
+        ]
+        bindings = compute_inter_client_bindings(placements)
+        assert len(bindings) == 2
+        forward = next(b for b in bindings if b.src_client_uid == "a")
+        assert isinstance(forward, InterClientBinding)
+        assert forward.src_edge == Edge.RIGHT
+        assert forward.dst_edge == Edge.LEFT
+        assert forward.src_axis_start == pytest.approx(180 / 1080)
+        assert forward.src_axis_end == pytest.approx(900 / 1080)
+        assert forward.dst_axis_start == 0
+        assert forward.dst_axis_end == 1
+        assert forward.map_src_to_dst_axis(540 / 1080) == pytest.approx(0.5)
+
+    def test_tolerance_and_disconnected_workspace_reachability(self):
+        server = [_mon(0, 0, 0, 1920, 1080)]
+        placements = [
+            self._placement("a", 0, 1921, 0, 1280, 1080),
+            self._placement("b", 0, 3202, 0, 1280, 1080),
+            self._placement("c", 0, 9000, 0, 1280, 1080),
+        ]
+        assert len(compute_inter_client_bindings(placements[:2])) == 2
+        assert connected_placement_indices(placements, server) == {0, 1}

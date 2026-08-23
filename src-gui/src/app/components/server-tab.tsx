@@ -39,7 +39,7 @@ import {
     getLocalIpAddress,
     removeClient as removeClientCommand,
     saveServerConfig,
-    setClientLayout,
+    setWorkspaceLayout,
     shareCertificate,
     startServer,
     stopServer,
@@ -152,9 +152,6 @@ export function ServerTab({onStatusChange, state}: ServerTabProps) {
 
     // Ref instead of the closure's clientManager: the SAVE listener registered in
     // openLayoutEditorWindow runs after Allow, but the freshly approved client lands a tick later.
-    const clientsRef = useRef(clientManager.clients);
-    clientsRef.current = clientManager.clients;
-
     const otpFocus = useRef<HTMLDivElement>(null);
     const saveOptionsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const ipInputRef = useRef<HTMLInputElement>(null);
@@ -315,75 +312,13 @@ export function ServerTab({onStatusChange, state}: ServerTabProps) {
                     const next = event.payload.placements || [];
                     setLayoutPlacements(next);
 
-                    // Dispatch one SetClientLayout per known client (empty list clears a stored layout).
-                    const currentClients = clientsRef.current;
-                    const groupKey = (c: typeof currentClients[number]) =>
-                        c.uid || c.id;
-                    const grouped = new Map<string, MonitorPlacement[]>();
-                    for (const c of currentClients) {
-                        grouped.set(groupKey(c), []);
-                    }
-                    for (const p of next) {
-                        const key = p.client_uid || '';
-                        const existing = grouped.get(key) ?? [];
-                        existing.push(p);
-                        grouped.set(key, existing);
-                    }
-
-                    const entries = Array.from(grouped).filter(
-                        ([clientKey, placements]) => {
-                            const client = currentClients.find(
-                                (c) => groupKey(c) === clientKey,
-                            );
-                            return Boolean(client) || placements.length > 0;
-                        },
-                    );
-                    const results = await Promise.allSettled(
-                        entries.map(([clientKey, placements]) => {
-                            const client = currentClients.find(
-                                (c) => groupKey(c) === clientKey,
-                            );
-                            return setClientLayout(
-                                client?.uid || undefined,
-                                placements,
-                                {
-                                    hostname: client?.name,
-                                    ipAddress: client?.ips?.[0],
-                                },
-                            );
-                        }),
-                    );
-
-                    let saved = 0;
-                    let failed = 0;
-                    results.forEach((res, i) => {
-                        if (res.status === 'fulfilled') {
-                            saved += 1;
-                            return;
-                        }
-                        failed += 1;
-                        const [clientKey] = entries[i];
-                        const client = currentClients.find(
-                            (c) => groupKey(c) === clientKey,
-                        );
-                        console.error(
-                            'SetClientLayout failed for',
-                            clientKey,
-                            res.reason,
-                        );
+                    try {
+                        await setWorkspaceLayout(next);
+                        addNotification('info', 'Layout saved');
+                    } catch (error) {
+                        console.error('SetWorkspaceLayout failed', error);
                         addNotification(
-                            'error',
-                            `Layout rejected for ${client?.name ?? clientKey}`,
-                            String(res.reason),
-                        );
-                    });
-
-                    if (failed === 0) {
-                        addNotification(
-                            'info',
-                            saved === 1
-                                ? 'Layout saved'
-                                : `Layout saved (${saved} clients)`,
+                            'error', 'Layout rejected', String(error),
                         );
                     }
                     cleanup();

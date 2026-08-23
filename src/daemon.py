@@ -21,42 +21,41 @@
 import asyncio
 import datetime
 import errno
-import msgspec
 import os
-import time
-import threading
-
-from os import path
 import signal
 import socket
 import sys
-from typing import Optional, Dict, Any, Callable
+import threading
+import time
 from enum import StrEnum
+from os import path
+from typing import Any, Callable, Dict, Optional
 
-from config import ApplicationConfig, ServerConfig, ClientConfig
+import msgspec
+
+from config import ApplicationConfig, ClientConfig, ServerConfig
+from event.notification import (
+    ErrorEvent,
+    InfoEvent,
+    NotificationEvent,
+    NotificationManager,
+    OtpGeneratedEvent,
+)
 from service.client import Client
 from service.server import Server, ServerStartError
 from utils import BackgroundTasks
-from utils.logging import Logger, get_logger
 from utils.cli import DaemonArguments
+from utils.logging import Logger, get_logger
 from utils.permissions import PermissionChecker
 from utils.permissions._base import PermissionResult, PermissionStatus, PermissionType
 from utils.runtime import (
-    env_endpoint_override,
     endpoint_to_socket_path,
+    env_endpoint_override,
     format_tcp_endpoint,
     format_unix_endpoint,
     remove_endpoint,
     write_endpoint,
 )
-from event.notification import (
-    NotificationManager,
-    NotificationEvent,
-    OtpGeneratedEvent,
-    InfoEvent,
-    ErrorEvent,
-)
-
 
 IS_WINDOWS = sys.platform in ("win32", "cygwin")
 
@@ -117,6 +116,7 @@ class DaemonCommand(StrEnum):
     LIST_PENDING_APPROVALS = "list_pending_approvals"
     # Multi-monitor layout (server only)
     SET_CLIENT_LAYOUT = "set_client_layout"
+    SET_WORKSPACE_LAYOUT = "set_workspace_layout"
 
     # SSL/Certificate management
     ENABLE_SSL = "enable_ssl"
@@ -2279,6 +2279,34 @@ class Daemon:
                     "client_uid": updated.uid,
                     "net_id": updated.get_net_id(),
                     "placements": list(updated.placements),
+                },
+            )
+        except Exception as e:
+            await self._notification_manager.notify_command_error(command, f"{str(e)}")
+
+    @CommandHandler.register(DaemonCommand.SET_WORKSPACE_LAYOUT)
+    async def _handle_set_workspace_layout(self, params: Dict[str, Any]) -> None:
+        """Atomically persist the complete shared workspace."""
+        command = DaemonCommand.SET_WORKSPACE_LAYOUT.value
+        if not self._server:
+            await self._notification_manager.notify_command_error(
+                command, "Server is not enabled"
+            )
+            return
+        try:
+            placements = params.get("placements", []) or []
+            updated = await self._server.set_workspace_layout(placements)
+            await self._notification_manager.notify_command_success(
+                command,
+                "Workspace layout updated",
+                result_data={
+                    "clients": [
+                        {
+                            "client_uid": client.uid,
+                            "placements": list(client.placements),
+                        }
+                        for client in updated
+                    ]
                 },
             )
         except Exception as e:

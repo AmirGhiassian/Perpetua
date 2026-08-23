@@ -19,15 +19,15 @@ import asyncio
 from typing import Any, Optional
 
 from event import (
-    BusEventType,
     ActiveScreenChangedEvent,
-    ClientStreamReconnectedEvent,
-    ClientDisconnectedEvent,
-    ClientConnectedEvent,
+    BusEventType,
     ClientActiveEvent,
+    ClientConnectedEvent,
+    ClientDisconnectedEvent,
+    ClientStreamReconnectedEvent,
 )
 from event.bus import EventBus
-from model.client import ClientsManager, ClientObj
+from model.client import ClientObj, ClientsManager
 from network.data import MissingTransportError
 from network.data.exchange import MessageExchange, MessageExchangeConfig
 from utils.logging import get_logger
@@ -608,12 +608,14 @@ class _ClientStreamHandler(StreamHandler):
 
         # Get data from queue
         data = await self._send_queue.get()
+        source = getattr(data, "source", None) or screen
+        target = getattr(data, "target", None) or "server"
         if not isinstance(data, dict) and hasattr(data, "to_dict"):
             data = data.to_dict()
         await self.msg_exchange.send_stream_type_message(
             stream_type=self.stream_type,
-            source=screen,
-            target="server",
+            source=source,
+            target=target,
             **data,
         )
 

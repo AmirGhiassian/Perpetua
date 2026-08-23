@@ -202,6 +202,31 @@ pub async fn set_client_layout(
 }
 
 #[tauri::command]
+pub async fn set_workspace_layout(
+    placements: serde_json::Value,
+    s: tauri::State<'_, AtomicAsyncWriter>,
+) -> Result<(), String> {
+    let payload = serde_json::json!({"placements": placements});
+    let command =
+        CommandEvent::build(CommandType::SetWorkspaceLayout, &payload.to_string());
+    let command = EventParser::serialize(&command).map_err(|e| {
+        format!(
+            "Failed to serialize {} command: {}",
+            CommandType::SetWorkspaceLayout,
+            e
+        )
+    })?;
+    s.send(command).await.map_err(|e| {
+        format!(
+            "Failed to send {} command ({})",
+            CommandType::SetWorkspaceLayout,
+            e
+        )
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn deny_client(
     peer_ip: String,
     s: tauri::State<'_, AtomicAsyncWriter>,

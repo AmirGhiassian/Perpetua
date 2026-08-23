@@ -15,12 +15,14 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 
-from utils import backend_module
 from typing import TYPE_CHECKING
+
+from utils import backend_module
 
 from ._monitor import (
     Edge,
     EdgeBinding,
+    InterClientBinding,
     LayoutBinding,
     LayoutReconciliation,
     LayoutSlot,
@@ -28,7 +30,9 @@ from ._monitor import (
     MonitorInfo,
     MonitorLayout,
     compute_edge_bindings,
+    compute_inter_client_bindings,
     compute_intra_client_bindings,
+    connected_placement_indices,
     reconcile_bindings_with_client_monitors,
 )
 
@@ -52,6 +56,9 @@ __all__ = [
     "LayoutReconciliation",
     "reconcile_bindings_with_client_monitors",
     "EdgeBinding",
+    "InterClientBinding",
     "compute_edge_bindings",
+    "compute_inter_client_bindings",
     "compute_intra_client_bindings",
+    "connected_placement_indices",
 ]
