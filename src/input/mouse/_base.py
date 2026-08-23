@@ -1960,6 +1960,7 @@ class ClientMouseController(object):
             )
             await self._force_return_to_server()
             return True
+        self._is_active = False
         await self.event_bus.dispatch(
             event_type=BusEventType.CLIENT_INACTIVE,
             data=None,

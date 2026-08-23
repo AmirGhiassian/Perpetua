@@ -45,6 +45,12 @@ describe("workspace graph validation", () => {
             "not connected to the server topology",
         );
     });
+
+    it("rejects a single detached client placement", () => {
+        const result = validatePlacements(server, [placement("a", 7000)]);
+        expect(result.ok).toBe(false);
+        expect([...result.notConnectedToServerIndices]).toEqual([0]);
+    });
 });
 
 describe("client placement snapping", () => {

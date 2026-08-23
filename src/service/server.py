@@ -1028,16 +1028,16 @@ class Server:
                     client.placements = kept
                     self.clients_manager.update_client(client)
 
-            if orphans:
-                try:
-                    await self.save_config()
-                except Exception as e:
-                    self._logger.warning(
-                        "Failed to persist layout reconciliation", error=str(e)
-                    )
-            if notify:
-                await self._refresh_workspace_topology(server_monitors)
-            return orphans
+        if orphans:
+            try:
+                await self.save_config()
+            except Exception as e:
+                self._logger.warning(
+                    "Failed to persist layout reconciliation", error=str(e)
+                )
+        if notify:
+            await self._refresh_workspace_topology(server_monitors)
+        return orphans
 
     async def _reconcile_single_client(
         self,

@@ -429,38 +429,37 @@ export function validatePlacements(
                     + `overlaps ${placements[j].client_uid}/${placements[j].client_monitor_id}`,
                 );
             }
-
-            if (serverRects.length > 0) {
-                const connected = new Set<number>();
-                placements.forEach((placement, index) => {
-                    if (isAdjacentToAny(placementAsRect(placement), serverRects)) {
-                        connected.add(index);
-                    }
-                });
-                let changed = true;
-                while (changed) {
-                    changed = false;
-                    placements.forEach((placement, index) => {
-                        if (connected.has(index)) return;
-                        const rect = placementAsRect(placement);
-                        if ([...connected].some((other) =>
-                            rectsAdjacent(rect, placementAsRect(placements[other]))
-                        )) {
-                            connected.add(index);
-                            changed = true;
-                        }
-                    });
-                }
-                placements.forEach((placement, index) => {
-                    if (connected.has(index)) return;
-                    notAdjacent.add(index);
-                    errors.push(
-                        `Client ${placement.client_uid} monitor ${placement.client_monitor_id} `
-                        + `is not connected to the server topology`,
-                    );
-                });
-            }
         }
+    }
+
+    if (serverRects.length > 0) {
+        const connected = new Set<number>();
+        const pending: number[] = [];
+        placements.forEach((placement, index) => {
+            if (isAdjacentToAny(placementAsRect(placement), serverRects)) {
+                connected.add(index);
+                pending.push(index);
+            }
+        });
+        while (pending.length > 0) {
+            const source = pending.shift()!;
+            const sourceRect = placementAsRect(placements[source]);
+            placements.forEach((placement, index) => {
+                if (connected.has(index)) return;
+                if (rectsAdjacent(sourceRect, placementAsRect(placement))) {
+                    connected.add(index);
+                    pending.push(index);
+                }
+            });
+        }
+        placements.forEach((placement, index) => {
+            if (connected.has(index)) return;
+            notAdjacent.add(index);
+            errors.push(
+                `Client ${placement.client_uid} monitor ${placement.client_monitor_id} `
+                + `is not connected to the server topology`,
+            );
+        });
     }
 
     return {
