@@ -756,7 +756,9 @@ class Server:
             for client in clients
         }
 
-    async def _refresh_workspace_topology(self, server_monitors=None) -> None:
+    async def _refresh_workspace_topology(
+        self, server_monitors=None, skip_uid: str | None = None
+    ) -> None:
         """Recompute and publish routes for every connected client."""
         if server_monitors is None:
             from utils.screen import Screen
@@ -767,6 +769,8 @@ class Server:
                 server_monitors = []
         topology = self._build_workspace_topology(server_monitors)
         for uid, routes in topology.items():
+            if uid == skip_uid:
+                continue
             await self.event_bus.dispatch(
                 event_type=BusEventType.CLIENT_LAYOUT_UPDATED,
                 data=ClientLayoutUpdatedEvent(
@@ -809,10 +813,10 @@ class Server:
                 client.placements = grouped.get(client.uid, [])
                 self.clients_manager.update_client(client)
                 updated.append(client)
-            if auto_save:
-                await self.save_config()
-            await self._refresh_workspace_topology(server_monitors)
-            return updated
+        if auto_save:
+            await self.save_config()
+        await self._refresh_workspace_topology(server_monitors)
+        return updated
 
     async def set_client_layout(
         self,
@@ -2008,7 +2012,7 @@ class Server:
                 inter_client_bindings=routes["inter"],
             ),
         )
-        await self._refresh_workspace_topology(server_monitors)
+        await self._refresh_workspace_topology(server_monitors, skip_uid=client.uid)
         await self.save_config()
         self._logger.info(f"Client {client.get_net_id()} connected")
 
